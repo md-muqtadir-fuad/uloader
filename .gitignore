@@ -1,0 +1,30 @@
+# Build output (build with build.bat or make)
+*.exe
+*.res
+*.o
+*.obj
+
+# Written by "uloader --install" (contains this machine's path)
+uloader-host.json
+
+# Download working files
+*.ulpart
+*.ulstate
+*.ulstate.tmp
+*.ulbt
+*.ulhls/
+*.tmp
+
+# Test leftovers
+__pycache__/
+*.pyc
+tests/**/work/
+tests/**/out/
+tests/**/runs/
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

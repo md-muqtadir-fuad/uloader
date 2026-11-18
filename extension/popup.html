@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>U-loader</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/icon32.png" alt="" width="20" height="20">
+    <h1>U-loader</h1>
+    <span id="status" class="status" title="Connection to U-loader">checking…</span>
+  </header>
+
+  <section id="setup" class="setup" hidden>
+    <p><strong>U-loader isn't connected to this browser yet.</strong></p>
+    <p>Run this once in a terminal (or use <em>Settings → Connect to browsers</em> in the U-loader window):</p>
+    <div class="cmd"><code>uloader --install</code><button id="copyCmd" class="ghost" type="button">Copy</button></div>
+  </section>
+
+  <section>
+    <button id="pageVideo" class="primary" type="button">Download video on this page</button>
+  </section>
+
+  <section>
+    <h2>Found on this page</h2>
+    <ul id="media" class="media"></ul>
+    <p id="mediaEmpty" class="empty">Nothing yet. Start playing the video, then open this again.</p>
+  </section>
+
+  <section>
+    <form id="linkForm" class="row">
+      <input id="link" type="text" placeholder="Paste a link, magnet or .torrent URL" autocomplete="off" spellcheck="false">
+      <button type="submit">Add</button>
+    </form>
+  </section>
+
+  <p id="msg" class="msg" role="status" aria-live="polite"></p>
+
+  <details>
+    <summary>Settings</summary>
+    <label class="check"><input id="tagger" type="checkbox"> Show a download button on videos</label>
+    <label class="check"><input id="capture" type="checkbox"> Take over browser downloads of these file types</label>
+    <textarea id="exts" rows="3" spellcheck="false"></textarea>
+    <div class="grid">
+      <label>Connections
+        <select id="connections">
+          <option>1</option><option>2</option><option>4</option><option>8</option><option>16</option><option>32</option>
+        </select>
+      </label>
+      <label>Video quality
+        <select id="quality">
+          <option value="0">Best</option><option value="2160">2160p</option><option value="1440">1440p</option>
+          <option value="1080">1080p</option><option value="720">720p</option><option value="480">480p</option>
+          <option value="360">360p</option>
+        </select>
+      </label>
+    </div>
+  </details>
+
+  <footer>
+    <button id="openApp" class="ghost" type="button">Open U-loader</button>
+    <span id="version"></span>
+  </footer>
+  <script src="popup.js"></script>
+</body>
+</html>
