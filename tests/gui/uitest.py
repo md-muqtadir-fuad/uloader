@@ -65,7 +65,7 @@ kernel32.GlobalLock.argtypes = [W.HGLOBAL]
 kernel32.GlobalLock.restype = ctypes.c_void_p
 kernel32.GlobalUnlock.argtypes = [W.HGLOBAL]
 
-CLASS = "ULoaderMainWindow"
+CLASS = os.environ.get("ULOADER_TEST_CLASS", "ULoaderMainWindow")   # a test build may use its own
 WM_NULL, WM_CLOSE, WM_KEYDOWN, WM_KEYUP, WM_COMMAND, WM_COPYDATA = 0x0, 0x10, 0x100, 0x101, 0x111, 0x4A
 LVM_GETITEMCOUNT, LVM_GETSELECTEDCOUNT = 0x1004, 0x1032
 SMTO_ABORTIFHUNG = 2

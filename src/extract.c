@@ -313,6 +313,7 @@ int ytdlp_run(http_session *s, ul_config *cfg, const char *url)
             if (rc == 0) {
                 if (ffmpeg) {
                     tlog(t, LOG_DIM, "Merging video + audio...");
+                    task_set_file(t, path_basename(final), final);   /* show the real name, not the part */
                     task_set_stage(t, "%s", "merging");
                     task_progress(t);
                     if (ffmpeg_merge(ffmpeg, vpath, apath, final, t) == 0) {

@@ -41,6 +41,7 @@
 #define WM_APP_SELCHANGE (WM_APP + 5)
 #define WM_APP_SHOW      (WM_APP + 7)   /* host.c: "show yourself"           */
 #define WM_APP_TESTDPI   (WM_APP + 9)   /* tests only (ULOADER_TEST_DPI set): act as if the DPI became wParam */
+#define WM_APP_COLSIZED  (WM_APP + 10)  /* the user resized column wParam */
 
 #define TIMER_TICK   1
 #define TIMER_SAVE   2
@@ -674,10 +675,8 @@ static void capture_layout(void)
         g_set.pmax = IsZoomed(g_hwnd) || (IsIconic(g_hwnd) && (wp.flags & WPF_RESTORETOMAXIMIZED));
     }
     if (g_lv) {
-        for (int i = 0; i < NCOLS; i++) {
-            int w = ListView_GetColumnWidth(g_lv, i);
-            if (w > 0) g_set.colw[i] = MulDiv(w, 96, (int)g_dpi);
-        }
+        /* column widths: g_set.colw already holds the widths the user chose
+           (the visible ones may be squeezed to fit a narrow window) */
         int ord[NCOLS];
         if (ListView_GetColumnOrderArray(g_lv, NCOLS, ord)) memcpy(g_set.order, ord, sizeof ord);
     }
@@ -2652,6 +2651,60 @@ static LRESULT CALLBACK detail_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 /* ------------------------------------------------------------------ */
 static int split_h(void) { return S(7); }
 
+/* Make the columns fill the list exactly - never a horizontal scrollbar.
+   The Name column takes what is left; on a narrow window the others shrink
+   toward a minimum and then the least important ones are hidden (they come
+   back when the window grows). g_set.colw holds the widths the user chose. */
+static void fit_columns(void)
+{
+    static const int MINW[NCOLS] = { 120, 56, 84, 62, 58, 92, 96 };  /* 96-dpi pixels */
+    static const int DROP[] = { COL_ETA, COL_SPEED, COL_SIZE };      /* last resorts */
+    if (!g_lv) return;
+    RECT wr;
+    GetWindowRect(g_lv, &wr);
+    /* always reserve the vertical scrollbar, so its coming and going
+       does not make the columns jump */
+    int avail = (wr.right - wr.left) - metric(SM_CXVSCROLL) - S(4);
+    int w[NCOLS], others = 0, name_min = S(MINW[COL_NAME]);
+    for (int i = 0; i < NCOLS; i++) {
+        w[i] = i == COL_NAME ? 0 : S(g_set.colw[i]);
+        others += w[i];
+    }
+    /* the name is what people read: it deserves about a third of the width */
+    int name_want = avail * 32 / 100 > name_min ? avail * 32 / 100 : name_min;
+    if (avail - others < name_want && w[COL_ADDED]) {      /* least useful column goes first */
+        others -= w[COL_ADDED];
+        w[COL_ADDED] = 0;
+    }
+    if (avail - others < name_want) {
+        int need = name_want - (avail - others), slack = 0;
+        for (int i = 0; i < NCOLS; i++)
+            if (i != COL_NAME && w[i] && w[i] > S(MINW[i])) slack += w[i] - S(MINW[i]);
+        if (slack > 0) {
+            int take = need < slack ? need : slack;
+            for (int i = 0; i < NCOLS; i++) {
+                if (i == COL_NAME || !w[i] || w[i] <= S(MINW[i])) continue;
+                int cut = (int)((int64_t)(w[i] - S(MINW[i])) * take / slack) + 1;
+                if (cut > w[i] - S(MINW[i])) cut = w[i] - S(MINW[i]);
+                w[i] -= cut;
+                others -= cut;
+            }
+        }
+        for (size_t k = 0; k < sizeof DROP / sizeof *DROP && avail - others < name_min; k++) {
+            others -= w[DROP[k]];
+            w[DROP[k]] = 0;
+        }
+    }
+    w[COL_NAME] = avail - others > name_min ? avail - others : name_min;
+    SendMessageW(g_lv, WM_SETREDRAW, FALSE, 0);
+    for (int i = 0; i < NCOLS; i++)
+        if (ListView_GetColumnWidth(g_lv, i) != w[i]) ListView_SetColumnWidth(g_lv, i, w[i]);
+    int hpos = GetScrollPos(g_lv, SB_HORZ);
+    if (hpos > 0) ListView_Scroll(g_lv, -hpos - S(2000), 0);     /* back to the left edge */
+    SendMessageW(g_lv, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_lv, NULL, FALSE);
+}
+
 static void layout(void)
 {
     if (!g_lv || !g_tb || !g_sb || !g_detail) return;
@@ -2672,18 +2725,14 @@ static void layout(void)
     int sh = split_h();
     int avail = bottom - top - sh;
     if (avail < 0) avail = 0;
-    /* the list keeps a fair share; the detail pane gives up its log first */
-    int list_min = S(170) < avail / 2 ? S(170) : avail / 2;
+    /* The detail pane always shows all of its rows (only the log below
+       them gives way); the list keeps at least a few rows. */
+    int list_min = S(96);
     int dh = S(g_set.detail_h);
+    if (dh < info_height()) dh = info_height();
     if (dh > avail - list_min) dh = avail - list_min;
     if (dh < S(60)) dh = S(60) < avail ? S(60) : avail;
     int lh = avail - dh;
-
-    /* the Name column absorbs changes of the window width */
-    if (g_list_w > 0 && w != g_list_w) {
-        int nw = ListView_GetColumnWidth(g_lv, COL_NAME) + (w - g_list_w);
-        ListView_SetColumnWidth(g_lv, COL_NAME, nw < S(140) ? S(140) : nw);
-    }
     if (g_list_w >= 0) g_list_w = w;
 
     HDWP dw = BeginDeferWindowPos(4);
@@ -2691,6 +2740,7 @@ static void layout(void)
     dw = DeferWindowPos(dw, g_lv, NULL, 0, top, w, lh, SWP_NOZORDER | SWP_NOACTIVATE);
     dw = DeferWindowPos(dw, g_detail, NULL, 0, top + lh + sh, w, dh, SWP_NOZORDER | SWP_NOACTIVATE);
     EndDeferWindowPos(dw);
+    fit_columns();
     SetRect(&g_split_rc, 0, top + lh, w, top + lh + sh);
     RECT inv = { 0, 0, w, top };
     InvalidateRect(g_hwnd, &inv, TRUE);
@@ -3673,6 +3723,12 @@ static void on_command(int id, int code)
 
 static LRESULT on_notify(NMHDR *h)
 {
+    /* the user dragged (or double-clicked) a column divider */
+    if (g_lv && h->hwndFrom == ListView_GetHeader(g_lv) &&
+        (h->code == HDN_ENDTRACKW || h->code == HDN_DIVIDERDBLCLICKW)) {
+        PostMessageW(g_hwnd, WM_APP_COLSIZED, (WPARAM)((NMHEADERW *)h)->iItem, 0);
+        return 0;
+    }
     if (h->hwndFrom == g_lv) {
         switch (h->code) {
         case LVN_GETDISPINFOW:
@@ -3879,9 +3935,17 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         layout();
         return 0;
     case WM_GETMINMAXINFO: {
+        /* small enough to tuck away, but never so small that the toolbar,
+           a few list rows and the whole detail block do not fit */
         MINMAXINFO *mm = (MINMAXINFO *)lp;
-        mm->ptMinTrackSize.x = S(620);
-        mm->ptMinTrackSize.y = S(440);
+        SIZE ts = { 0, 0 };                     /* every toolbar button must stay visible */
+        if (g_tb) SendMessageW(g_tb, TB_GETIDEALSIZE, FALSE, (LPARAM)&ts);
+        int minw = ts.cx + S(20) > S(560) ? ts.cx + S(20) : S(560);
+        RECT need = { 0, 0, minw, (g_tb_area ? g_tb_area : S(44)) + 1 + S(96) + split_h() +
+                                  info_height() + S(26) };
+        AdjustWindowRectEx(&need, WS_OVERLAPPEDWINDOW, FALSE, 0);
+        mm->ptMinTrackSize.x = need.right - need.left;
+        mm->ptMinTrackSize.y = need.bottom - need.top;
         return 0;
     }
     case WM_DPICHANGED:
@@ -3932,8 +3996,8 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int bottom = rc.bottom - (sr.bottom - sr.top);
             int y = GET_Y_LPARAM(lp) - g_split_grab;
             int dh = bottom - y - split_h();
+            if (dh < info_height()) dh = info_height();     /* the details stay whole */
             g_set.detail_h = MulDiv(dh, 96, (int)g_dpi);
-            if (g_set.detail_h < 60) g_set.detail_h = 60;
             layout();
             UpdateWindow(hwnd);
         }
@@ -3949,6 +4013,17 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_NOTIFY:
         return on_notify((NMHDR *)lp);
+    case WM_APP_COLSIZED: {
+        /* remember the width the user picked; the Name column re-fills the rest */
+        int col = (int)wp;
+        if (col > COL_NAME && col < NCOLS) {
+            int cw = ListView_GetColumnWidth(g_lv, col);
+            g_set.colw[col] = cw > 0 ? MulDiv(cw, 96, (int)g_dpi) : COL_DEFW[col];
+            if (g_set.colw[col] < 24) g_set.colw[col] = 24;
+        }
+        fit_columns();
+        return 0;
+    }
     case WM_COMMAND:
         on_command(LOWORD(wp), HIWORD(wp));
         return 0;
@@ -4108,13 +4183,8 @@ static void place_window(int start_hidden)
     }
     RECT cr;
     GetClientRect(g_hwnd, &cr);
-    if (!g_set.has_cols) {            /* first run: the columns fill the window, no horizontal scrolling */
-        int others = 0;
-        for (int i = 0; i < NCOLS; i++) if (i != COL_NAME) others += ListView_GetColumnWidth(g_lv, i);
-        int nw = cr.right - others - metric(SM_CXVSCROLL) - S(4);
-        ListView_SetColumnWidth(g_lv, COL_NAME, nw < S(140) ? S(140) : nw);
-    }
-    g_list_w = cr.right;              /* from now on the Name column follows the window width */
+    fit_columns();                    /* the columns always fill the list exactly */
+    g_list_w = cr.right;
     if (!start_hidden) {
         ShowWindow(g_hwnd, g_set.pmax ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL);
         UpdateWindow(g_hwnd);

@@ -31,7 +31,9 @@
                        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 /* GUI <-> native host contract */
+#ifndef UL_GUI_CLASS                    /* a test build may use its own class */
 #define UL_GUI_CLASS      L"ULoaderMainWindow"
+#endif
 #define UL_GUI_EXE        "uloader-gui.exe"
 #define UL_COPYDATA_JOB   0x554C4A42   /* WM_COPYDATA dwData; lpData = UTF-8 job file path */
 #define UL_HOST_NAME      "com.uloader.host"
