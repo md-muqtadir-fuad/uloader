@@ -507,6 +507,7 @@ typedef struct {
     int64_t  off, len;  /* position in the torrent's byte stream                 */
     int      pad;       /* BEP 47 padding file: never created, reads as zeros    */
     HANDLE   h;
+    int      rw;        /* h was opened for writing too                           */
     uint32_t used;
 } bfile;
 
@@ -573,9 +574,10 @@ static char *path_component(const uint8_t *s, size_t n)
     return c;
 }
 
+/* a usable path.utf-8: a non-empty list of valid UTF-8 strings */
 static int path_list_ok_utf8(const bdoc *d, int list)
 {
-    if (be_type(d, list) != BE_LIST) return 0;
+    if (be_type(d, list) != BE_LIST || d->n[list].child < 0) return 0;
     for (int k = d->n[list].child; k >= 0; k = d->n[k].next) {
         size_t n;
         const uint8_t *s = be_str(d, k, &n);
@@ -622,7 +624,7 @@ static int meta_parse(meta *m, const uint8_t *info, size_t len, char *err, size_
     int nm = be_get(&d, 0, "name.utf-8");
     size_t nl;
     const uint8_t *ns = be_str(&d, nm, &nl);
-    if (!ns || !utf8_valid(ns, nl)) { nm = be_get(&d, 0, "name"); ns = be_str(&d, nm, &nl); }
+    if (!ns || !nl || !utf8_valid(ns, nl)) { nm = be_get(&d, 0, "name"); ns = be_str(&d, nm, &nl); }
     if (!ns) { snprintf(err, el, "invalid torrent: it has no name"); goto fail; }
     m->disp = be_cstr(&d, nm);
 
@@ -667,9 +669,17 @@ static int meta_parse(meta *m, const uint8_t *info, size_t len, char *err, size_
             size_t al = 0;
             const uint8_t *attr = be_str(&d, be_get(&d, k, "attr"), &al);
             f->pad = attr && memchr(attr, 'p', al) != NULL;
-            int pl = be_get(&d, k, "path.utf-8");
-            if (!path_list_ok_utf8(&d, pl)) pl = be_get(&d, k, "path");
-            char *sub = join_path_list(&d, pl, &m->dropped);
+            /* path.utf-8 when it is usable, else path (also when nothing of
+               path.utf-8 survives sanitizing but path has something) */
+            int pl = be_get(&d, k, "path.utf-8"), drop = 0;
+            char *sub = path_list_ok_utf8(&d, pl) ? join_path_list(&d, pl, &drop) : NULL;
+            if (!sub || !*sub) {
+                int drop2 = 0;
+                char *alt = join_path_list(&d, be_get(&d, k, "path"), &drop2);
+                if (alt && (*alt || !sub)) { free(sub); sub = alt; drop = drop2; }
+                else free(alt);
+            }
+            m->dropped += drop;
             if (!sub) { snprintf(err, el, "invalid torrent: bad file path"); goto fail; }
             if (!*sub && !f->pad) {      /* nothing usable left of the path */
                 free(sub);
@@ -713,7 +723,7 @@ fail0:
 }
 
 /* ---- file layout ---- */
-typedef struct { char **k; size_t cap, n; } nameset;
+typedef struct { char **k; int *v; size_t cap, n; } nameset;   /* v: a number per name */
 
 static uint64_t str_hash(const char *s)
 {
@@ -722,40 +732,51 @@ static uint64_t str_hash(const char *s)
     return h;
 }
 
-static int nameset_has(const nameset *t, const char *s)
+static int *nameset_find(const nameset *t, const char *s)
 {
-    if (!t->cap) return 0;
+    if (!t->cap) return NULL;
     for (size_t i = str_hash(s) & (t->cap - 1); t->k[i]; i = (i + 1) & (t->cap - 1))
-        if (!strcmp(t->k[i], s)) return 1;
-    return 0;
+        if (!strcmp(t->k[i], s)) return &t->v[i];
+    return NULL;
 }
 
-static void nameset_add(nameset *t, const char *s)
+static int nameset_has(const nameset *t, const char *s) { return nameset_find(t, s) != NULL; }
+
+/* adds s (number 0) unless it is there; returns its number */
+static int *nameset_add(nameset *t, const char *s)
 {
-    if (nameset_has(t, s)) return;
+    int *v = nameset_find(t, s);
+    if (v) return v;
     if ((t->n + 1) * 2 > t->cap) {
         size_t nc = t->cap ? t->cap * 2 : 64;
         char **nk = xcalloc(nc, sizeof(char *));
+        int *nv = xcalloc(nc, sizeof(int));
         for (size_t i = 0; i < t->cap; i++) {
             if (!t->k[i]) continue;
             size_t j = str_hash(t->k[i]) & (nc - 1);
             while (nk[j]) j = (j + 1) & (nc - 1);
             nk[j] = t->k[i];
+            nv[j] = t->v[i];
         }
         free(t->k);
+        free(t->v);
         t->k = nk;
+        t->v = nv;
         t->cap = nc;
     }
     size_t j = str_hash(s) & (t->cap - 1);
     while (t->k[j]) j = (j + 1) & (t->cap - 1);
     t->k[j] = xstrdup(s);
+    t->v[j] = 0;
     t->n++;
+    return &t->v[j];
 }
 
 static void nameset_free(nameset *t)
 {
     for (size_t i = 0; i < t->cap; i++) free(t->k[i]);
     free(t->k);
+    free(t->v);
     memset(t, 0, sizeof *t);
 }
 
@@ -816,7 +837,8 @@ static int meta_layout(meta *m, const char *out_dir, const char *top, char *err,
     }
     m->renamed = 0;
     if (m->multi) {
-        nameset dirs = { 0 }, used = { 0 };
+        nameset dirs = { 0 }, used = { 0 }, next = { 0 };    /* next: name -> next " (n)" to try */
+        int rc = 0;
         for (int i = 0; i < m->nfiles; i++) {
             if (m->files[i].pad) continue;
             char *key = lower_key(m->files[i].rel);
@@ -824,28 +846,43 @@ static int meta_layout(meta *m, const char *out_dir, const char *top, char *err,
                 if (*q == '\\') { *q = 0; nameset_add(&dirs, key); *q = '\\'; }
             free(key);
         }
-        for (int i = 0; i < m->nfiles; i++) {
+        for (int i = 0; i < m->nfiles && rc == 0; i++) {
             bfile *f = &m->files[i];
             if (f->pad) continue;
             char *key = lower_key(f->rel);
-            for (int n = 2; nameset_has(&dirs, key) || nameset_has(&used, key); n++) {
-                char *alt = suffixed(m->files[i].rel, n);
-                free(key);
-                key = lower_key(alt);
-                if (!nameset_has(&dirs, key) && !nameset_has(&used, key)) {
-                    free(f->rel);
-                    f->rel = alt;
-                    m->renamed++;
-                    break;
+            if (nameset_has(&dirs, key) || nameset_has(&used, key)) {
+                /* carry on from where the previous file of this name stopped:
+                   every name tried is then a different taken one, so even a
+                   million equal names cost a million tries, not a million squared */
+                int *nx = nameset_add(&next, key);
+                if (*nx < 2) *nx = 2;
+                for (;;) {
+                    if (*nx > 4000000) {
+                        snprintf(err, el, "invalid torrent: too many files named %s", f->rel);
+                        rc = -1;
+                        break;
+                    }
+                    char *alt = suffixed(f->rel, (*nx)++);
+                    char *ak = lower_key(alt);
+                    if (!nameset_has(&dirs, ak) && !nameset_has(&used, ak)) {
+                        free(f->rel);
+                        f->rel = alt;
+                        free(key);
+                        key = ak;
+                        m->renamed++;
+                        break;
+                    }
+                    free(alt);
+                    free(ak);
                 }
-                free(alt);
-                if (n > 100000) break;
             }
-            nameset_add(&used, key);
+            if (rc == 0) nameset_add(&used, key);
             free(key);
         }
         nameset_free(&dirs);
         nameset_free(&used);
+        nameset_free(&next);
+        if (rc) return rc;
     }
     for (int i = 0; i < m->nfiles; i++) {
         bfile *f = &m->files[i];
@@ -917,14 +954,28 @@ static void magnet_free(magnet *m)
     memset(m, 0, sizeof *m);
 }
 
+/* Trim s where it is: the text stays at the start of its buffer, so the
+   pointer can still be freed (unlike str_trim's result). */
+static char *trim_owned(char *s)
+{
+    size_t a = 0, n = strlen(s);
+    while (a < n && isspace((unsigned char)s[a])) a++;
+    while (n > a && isspace((unsigned char)s[n - 1])) n--;
+    memmove(s, s + a, n - a);
+    s[n - a] = 0;
+    return s;
+}
+
 static int magnet_parse(const char *uri, magnet *m, char *err, size_t el)
 {
     memset(m, 0, sizeof *m);
     if (!str_istarts(uri, "magnet:?")) { snprintf(err, el, "not a magnet link"); return -1; }
     int have = 0, bad = 0, v2 = 0;
     const char *p = uri + 8;
-    while (*p) {
+    const char *end = p + strcspn(p, "#");          /* a #fragment is not part of the query */
+    while (p < end) {
         size_t n = strcspn(p, "&");
+        if (n > (size_t)(end - p)) n = (size_t)(end - p);
         const char *kv = p;
         size_t kvn = n;
         if (kvn >= 4 && _strnicmp(kv, "amp;", 4) == 0) { kv += 4; kvn -= 4; }   /* pasted from HTML */
@@ -952,14 +1003,14 @@ static int magnet_parse(const char *uri, magnet *m, char *err, size_t el)
                 m->dn = url_decode(raw, strlen(raw));
                 free(raw);
             } else if (!strcmp(key, "tr") || !strncmp(key, "tr.", 3)) {
-                if (m->ntr < MAG_MAX_TR) m->tr[m->ntr++] = str_trim(url_decode(v, vl)) ;
+                if (m->ntr < MAG_MAX_TR) m->tr[m->ntr++] = trim_owned(url_decode(v, vl));
             } else if (!strcmp(key, "x.pe")) {
                 if (m->npe < MAG_MAX_TR) m->pe[m->npe++] = url_decode(v, vl);
             }
             free(key);
         }
         p += n;
-        if (*p == '&') p++;
+        if (p < end && *p == '&') p++;
     }
     if (!have) {
         snprintf(err, el, "%s", bad ? "the magnet link has an invalid info-hash" :
@@ -1019,10 +1070,18 @@ static void set_sparse(HANDLE h, BOOLEAN on)
     DeviceIoControl(h, FSCTL_SET_SPARSE, &sb, sizeof sb, NULL, 0, &ret, NULL);
 }
 
-static HANDLE stor_open(meta *m, int fi)
+/* write = 0: only reading (checking existing files, uploading), which also
+   works on read-only files and on files another program has open for
+   writing; write = 1 creates the file (and its folders) when needed */
+static HANDLE stor_open(meta *m, int fi, int write)
 {
     bfile *f = &m->files[fi];
-    if (f->h != INVALID_HANDLE_VALUE) { f->used = ++m->lru; return f->h; }
+    if (f->h != INVALID_HANDLE_VALUE) {
+        if (f->rw || !write) { f->used = ++m->lru; return f->h; }
+        CloseHandle(f->h);                      /* was opened for reading only */
+        f->h = INVALID_HANDLE_VALUE;
+        m->nopen--;
+    }
     if (m->nopen >= 48) {                       /* keep the number of open files bounded */
         int victim = -1;
         for (int i = 0; i < m->nfiles; i++)
@@ -1031,14 +1090,20 @@ static HANDLE stor_open(meta *m, int fi)
         if (victim >= 0) { CloseHandle(m->files[victim].h); m->files[victim].h = INVALID_HANDLE_VALUE; m->nopen--; }
     }
     wchar_t *w = wpath(f->path);
-    HANDLE h = CreateFileW(w, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND) {
-        char *dir = path_dirname(f->path);
-        dir_create(dir);
-        free(dir);
+    HANDLE h;
+    if (!write) {
+        h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
+    } else {
         h = CreateFileW(w, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS,
                         FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PATH_NOT_FOUND) {
+            char *dir = path_dirname(f->path);
+            dir_create(dir);
+            free(dir);
+            h = CreateFileW(w, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+        }
     }
     free(w);
     if (h == INVALID_HANDLE_VALUE) {
@@ -1047,6 +1112,7 @@ static HANDLE stor_open(meta *m, int fi)
         return INVALID_HANDLE_VALUE;
     }
     f->h = h;
+    f->rw = write;
     f->used = ++m->lru;
     m->nopen++;
     return h;
@@ -1067,7 +1133,7 @@ static int stor_io(meta *m, int64_t off, uint8_t *buf, int64_t len, int write)
             if (!write) memset(p, 0, (size_t)left);
             continue;
         }
-        HANDLE h = stor_open(m, sg[i].fi);
+        HANDLE h = stor_open(m, sg[i].fi, write);
         if (h == INVALID_HANDLE_VALUE) { rc = -1; break; }
         while (left > 0) {
             DWORD k = left > (1 << 30) ? (1u << 30) : (DWORD)left, got = 0;
@@ -1094,19 +1160,22 @@ static int stor_io(meta *m, int64_t off, uint8_t *buf, int64_t len, int write)
     return rc;
 }
 
-/* Create every file at its final size (sparse, so nothing is written).
-   Returns 0, -1 on error, -2 when aborted. */
+/* Give every file its final size: missing ones are created (sparse, so
+   nothing is written), longer ones are cut. Files that already have the
+   right size are not opened. Returns 0, -1 on error, -2 when aborted. */
 static int stor_prepare(meta *m, const ul_task *t)
 {
     for (int i = 0; i < m->nfiles; i++) {
         bfile *f = &m->files[i];
         if (f->pad) continue;
         if ((i & 63) == 63 && task_aborted(t)) return -2;
-        HANDLE h = stor_open(m, i);
+        if (f->h == INVALID_HANDLE_VALUE && file_size(f->path) == f->len) continue;
+        HANDLE h = stor_open(m, i, 1);
         if (h == INVALID_HANDLE_VALUE) return -1;
         LARGE_INTEGER sz;
-        if (!GetFileSizeEx(h, &sz) || sz.QuadPart != f->len) {
-            if (f->len > 0) set_sparse(h, TRUE);
+        int known = GetFileSizeEx(h, &sz) != 0;
+        if (!known || sz.QuadPart != f->len) {
+            if (f->len > 0 && (!known || f->len > sz.QuadPart)) set_sparse(h, TRUE);   /* growing only */
             LARGE_INTEGER li;
             li.QuadPart = f->len;
             if (!SetFilePointerEx(h, li, NULL, FILE_BEGIN) || !SetEndOfFile(h)) {
@@ -1154,6 +1223,9 @@ enum { PS_CONNECTING = 1, PS_HANDSHAKE, PS_ACTIVE };
 
 typedef struct { int piece, begin, len; double t; } preq;
 
+#define CXL_N 64            /* requests we took back from a peer, remembered */
+typedef struct { int piece, begin; } pblk;
+
 typedef struct {
     SOCKET   s;
     baddr    a;
@@ -1174,6 +1246,8 @@ typedef struct {
     int      pre_isbf;
     preq     req[MAX_PIPE];
     int      nreq;
+    pblk     cxl[CXL_N];        /* cancelled / released: may still arrive */
+    int      ncxl, cxl_pos;
     preq     upq[MAX_UPQ];
     int      nup;
     int      md_piece, md_bad;
@@ -1202,6 +1276,7 @@ typedef struct job {
     uint8_t    ih[20], pid[20];
     int64_t    down, up, left;
     int        event;            /* 0 none, 1 completed, 2 started, 3 stopped */
+    int        final;            /* "completed"/"stopped": not cancelled by Ctrl+C */
     uint32_t   key;
     ul_config *cfg;              /* private copies: the thread may outlive the torrent */
     ul_task   *t;
@@ -1316,6 +1391,9 @@ typedef struct {
     uint8_t      *md, *md_st;
     baddr        *md_from;
     int           md_n, md_fails;
+    int           md_solo;            /* after a mixed bad copy: one peer at a time */
+    int           md_src_set;
+    baddr         md_src;             /* that peer */
 
     /* statistics and timers */
     int64_t       down, up, wasted;
@@ -1371,7 +1449,9 @@ static void job_release(job *j)
     free(j);
 }
 
-static int job_aborted(const job *j) { return task_aborted(j->t); }
+/* The final announces are sent after a pause, which on the console is the
+   global Ctrl+C flag: they only stop for their own flag. */
+static int job_aborted(const job *j) { return j->final ? j->t->abort != 0 : task_aborted(j->t); }
 
 static void job_add_addr(job *j, const baddr *a)
 {
@@ -1510,8 +1590,10 @@ static int udp_wait(job *j, SOCKET s, const baddr *from, uint8_t *buf, int cap, 
         struct timeval tv = { 0, (long)((left > 0.25 ? 0.25 : left) * 1e6) };
         if (select(0, &rd, NULL, NULL, &tv) <= 0) continue;
         struct sockaddr_storage ss;
+        memset(&ss, 0, sizeof ss);
         int sl = sizeof ss;
         int n = recvfrom(s, (char *)buf, cap, 0, (struct sockaddr *)&ss, &sl);
+        if (n < 0 && WSAGetLastError() == WSAEMSGSIZE) n = cap;    /* longer than buf: use its start */
         if (n <= 0) continue;
         baddr a;
         if (!addr_from_sa(&a, (struct sockaddr *)&ss) || !addr_eq(&a, from)) continue;
@@ -1556,14 +1638,15 @@ static void udp_announce(job *j)
     DWORD ret;
     WSAIoctl(s, SIO_UDP_CONNRESET, &off, sizeof off, NULL, 0, &ret, NULL, NULL);
 
-    uint8_t pkt[100], rb[1500 + 20];
+    /* 20 bytes + 18 per IPv6 peer: 100 peers need 1820 bytes */
+    uint8_t pkt[100], rb[8192];
     uint8_t conn[8] = { 0 };
     int stage = 0;
     for (; stage < 2 && !job_aborted(j); stage++) {
         int done = 0;
+        uint32_t tid;                      /* the same for every attempt: a late answer still counts */
+        rand_bytes(&tid, sizeof tid);
         for (int attempt = 0; attempt < 3 && !done && !job_aborted(j); attempt++) {
-            uint32_t tid;
-            rand_bytes(&tid, sizeof tid);
             int pl;
             if (stage == 0) {
                 wr32(pkt, 0x417);              /* protocol id 0x41727101980 */
@@ -1606,8 +1689,9 @@ static void udp_announce(job *j)
                 if (stage == 0 && action == 0 && n >= 16) { memcpy(conn, rb + 8, 8); done = 1; }
                 else if (stage == 1 && action == 1 && n >= 20) {
                     j->interval = (int)(rd32(rb + 8) > 86400 ? 86400 : rd32(rb + 8));
-                    j->leechers = (int)(rd32(rb + 12) & 0x7FFFFFFF);
-                    j->seeders = (int)(rd32(rb + 16) & 0x7FFFFFFF);
+                    uint32_t le = rd32(rb + 12), se = rd32(rb + 16);   /* above INT_MAX: nonsense, unknown */
+                    j->leechers = le > INT_MAX ? 0 : (int)le;
+                    j->seeders = se > INT_MAX ? 0 : (int)se;
                     int step = ta.fam == 6 ? 18 : 6;
                     for (int i = 20; i + step <= n; i += step) {
                         baddr a;
@@ -1651,6 +1735,8 @@ static void resolve_hosts(job *j)
     j->ok = j->naddr > 0;
 }
 
+static volatile LONG g_final_jobs;   /* final announces still on their way */
+
 static unsigned __stdcall job_main(void *arg)
 {
     job *j = arg;
@@ -1658,7 +1744,9 @@ static unsigned __stdcall job_main(void *arg)
     else if (str_istarts(j->url, "udp://")) udp_announce(j);
     else http_announce(j);
     InterlockedExchange(&j->done, 1);
+    int final = j->final;
     job_release(j);
+    if (final) InterlockedDecrement(&g_final_jobs);
     return 0;
 }
 
@@ -1893,11 +1981,32 @@ static void unrequest(bt *b, int piece, int begin)
     if (a->dup[j] == 0 && a->st[j] == 1) { a->st[j] = 0; a->nfree++; }
 }
 
+/* A request we took back (cancelled, or dropped on a choke): the peer may
+   have sent the block already, so when it arrives it was not unasked. */
+static void cxl_add(peer *p, int piece, int begin)
+{
+    p->cxl[p->cxl_pos].piece = piece;
+    p->cxl[p->cxl_pos].begin = begin;
+    p->cxl_pos = (p->cxl_pos + 1) % CXL_N;
+    if (p->ncxl < CXL_N) p->ncxl++;
+}
+
+static int cxl_take(peer *p, uint32_t piece, uint32_t begin)
+{
+    for (int k = 0; k < p->ncxl; k++)
+        if (p->cxl[k].piece >= 0 && (uint32_t)p->cxl[k].piece == piece && (uint32_t)p->cxl[k].begin == begin) {
+            p->cxl[k].piece = -1;
+            return 1;
+        }
+    return 0;
+}
+
 static void release_requests(bt *b, peer *p, int cancel)
 {
     for (int r = 0; r < p->nreq; r++) {
         unrequest(b, p->req[r].piece, p->req[r].begin);
         if (cancel) send_req(b, p, 8, p->req[r].piece, p->req[r].begin, p->req[r].len);
+        cxl_add(p, p->req[r].piece, p->req[r].begin);
     }
     p->nreq = 0;
 }
@@ -2095,7 +2204,7 @@ static void on_block(bt *b, peer *p, uint32_t idx, uint32_t begin, const uint8_t
     p->got += len;
     p->got_sec += len;
     b->down += len;
-    if (r < 0) {
+    if (r < 0 && !cxl_take(p, idx, begin)) {
         p->unrequested += len;
         if (p->unrequested > (8 << 20)) { peer_kill(p, "sends data nobody asked for"); return; }
     }
@@ -2105,7 +2214,14 @@ static void on_block(bt *b, peer *p, uint32_t idx, uint32_t begin, const uint8_t
     apiece *a = b->act[s];
     if (begin % BLOCK || begin >= (uint32_t)a->len) { b->wasted += len; return; }
     int j = (int)(begin / BLOCK);
-    if ((int)len != blk_len(a, j)) { b->wasted += len; return; }
+    if ((int)len != blk_len(a, j)) {
+        b->wasted += len;
+        if (r >= 0) {                    /* our request is gone: the block must be free to ask again */
+            unrequest(b, (int)idx, (int)begin);
+            peer_kill(p, "sent a block of the wrong size");
+        }
+        return;
+    }
     if (r >= 0 && a->dup[j]) a->dup[j]--;
     if (a->st[j] == 2) { b->wasted += len; return; }       /* endgame duplicate */
     if (a->st[j] == 0) a->nfree--;
@@ -2121,6 +2237,7 @@ static void on_block(bt *b, peer *p, uint32_t idx, uint32_t begin, const uint8_t
                 if ((uint32_t)q->req[k].piece == idx && (uint32_t)q->req[k].begin == begin) {
                     if (!q->dead) send_req(b, q, 8, (int)idx, (int)begin, (int)len);
                     drop_req(q, k);
+                    cxl_add(q, (int)idx, (int)begin);
                     break;
                 }
         }
@@ -2142,7 +2259,24 @@ static void md_reset(bt *b)
     b->md_from = NULL;
     b->md_size = 0;
     b->md_n = 0;
+    b->md_src_set = 0;
     for (int i = 0; i < b->npeers; i++) b->p[i]->md_piece = -1;
+}
+
+/* One peer at a time (after a bad copy that came from several): p may ask
+   unless another usable peer is the one we are getting it from. */
+static int md_take_source(bt *b, peer *p)
+{
+    if (b->md_src_set && !addr_eq(&b->md_src, &p->a))
+        for (int i = 0; i < b->npeers; i++) {
+            peer *q = b->p[i];
+            if (q != p && addr_eq(&q->a, &b->md_src) && q->st == PS_ACTIVE && !q->dead && q->ut_md &&
+                q->md_bad < 3 && q->md_size == b->md_size)
+                return 0;
+        }
+    b->md_src = p->a;
+    b->md_src_set = 1;
+    return 1;
 }
 
 static void md_request(bt *b, peer *p)
@@ -2178,6 +2312,7 @@ static void md_request(bt *b, peer *p)
         if (b->md_st[i] == 0) { pick = i; break; }
     }
     if (pick < 0) return;
+    if (b->md_solo && !md_take_source(b, p)) return;
     b->md_st[pick] = 1;
     p->md_piece = pick;
     p->md_t = b->now;
@@ -2192,12 +2327,16 @@ static void md_complete(bt *b)
     sha1(b->md, (size_t)b->md_size, h);
     if (memcmp(h, b->ih, 20) != 0) {
         b->md_fails++;
-        tlog(b->t, LOG_WARN, "  the metadata received from peers does not match the info-hash - trying again");
-        for (int i = 0; i < b->md_n; i++) {
-            int dup = 0;
-            for (int k = 0; k < i; k++) if (addr_eq(&b->md_from[k], &b->md_from[i])) dup = 1;
-            if (!dup) ban_addr(b, &b->md_from[i], "sent bad metadata");
-        }
+        /* Only a copy that came from one peer alone proves that peer bad. A
+           mixed one cannot tell the liar from the honest peers, so nobody is
+           banned and the next copies come from one peer at a time. */
+        int nsrc = b->md_n > 0;
+        for (int i = 1; i < b->md_n && nsrc < 2; i++)
+            if (!addr_eq(&b->md_from[i], &b->md_from[0])) nsrc = 2;
+        tlog(b->t, LOG_WARN, "  the metadata received from peers does not match the info-hash - trying again%s",
+             nsrc > 1 && !b->md_solo ? ", one peer at a time" : "");
+        if (nsrc == 1) ban_addr(b, &b->md_from[0], "sent bad metadata");
+        else b->md_solo = 1;
         md_reset(b);
         if (b->md_fails >= 8) bt_fail(b, "could not get valid metadata for this torrent from its peers");
         return;
@@ -2214,10 +2353,10 @@ static void md_complete(bt *b)
     md_reset(b);
     b->m = m;
     b->have_meta = 1;
-    if (setup_meta(b, NULL, NULL, 0) != 0) {
-        b->have_meta = 0;          /* failed or paused: peers stay in "no metadata" mode until we stop */
-        return;
-    }
+    /* The metadata stays known even when the setup fails or is paused: the
+       peers switch to it (so they all have a piece map), nothing asks for
+       metadata again, and stopping saves it with the progress. */
+    setup_meta(b, NULL, NULL, 0);
     for (int i = 0; i < b->npeers; i++)
         if (b->p[i]->st == PS_ACTIVE && !b->p[i]->dead) peer_meta_ready(b, b->p[i]);
 }
@@ -2230,7 +2369,7 @@ static void on_metadata_msg(bt *b, peer *p, const uint8_t *d, size_t n)
     int64_t type = -1, piece = -1, total = -1;
     be_int(&x, be_get(&x, 0, "msg_type"), &type);
     be_int(&x, be_get(&x, 0, "piece"), &piece);
-    be_int(&x, be_get(&x, 0, "total_size"), &total);
+    int has_total = be_int(&x, be_get(&x, 0, "total_size"), &total);
     be_free(&x);
     if (type == 0) {                                  /* a peer asks us */
         if (!p->ut_md) return;
@@ -2254,13 +2393,17 @@ static void on_metadata_msg(bt *b, peer *p, const uint8_t *d, size_t n)
         return;
     }
     if (type != 1) return;
+    if (p->md_piece != i) return;                     /* only what we asked this peer for */
+    /* the data must have the size of the piece; total_size, when given (it
+       is not needed: the size we went with decides), must be that size */
     int64_t expect = i == b->md_n - 1 ? b->md_size - (int64_t)i * MD_PIECE : MD_PIECE;
-    if ((int64_t)(n - used) != expect || (total >= 0 && total != b->md_size)) {
-        if (p->md_piece == i) { b->md_st[i] = 0; p->md_piece = -1; }
+    if ((int64_t)(n - used) != expect || (has_total && total != b->md_size)) {
+        b->md_st[i] = 0;
+        p->md_piece = -1;
         p->md_bad++;
         return;
     }
-    if (p->md_piece == i) p->md_piece = -1;
+    p->md_piece = -1;
     if (b->md_st[i] == 2) return;
     memcpy(b->md + (size_t)i * MD_PIECE, d + used, (size_t)expect);
     b->md_st[i] = 2;
@@ -2711,10 +2854,13 @@ static job *announce_job(bt *b, int ti, int event)
     return j;
 }
 
+static int dht_wants_helpers(const bt *b);
+
 static void trackers_tick(bt *b)
 {
     int shortp = b->nactive < 15 && connectable(b) < 10;
-    for (int i = 0; i < b->ntr && b->njobs < MAX_JOBS; i++) {
+    int cap = MAX_JOBS - dht_wants_helpers(b);          /* those stay free for the DHT */
+    for (int i = 0; i < b->ntr && b->njobs < cap; i++) {
         tracker *t = &b->tr[i];
         if (t->busy) continue;
         int due = b->now >= t->next;
@@ -2767,13 +2913,24 @@ static void tracker_done(bt *b, job *j)
     free(host);
 }
 
-/* fire and forget: "completed" / "stopped" */
+void torrent_flush_announces(int ms)
+{
+    for (int waited = 0; g_final_jobs > 0 && waited < ms; waited += 50) Sleep(50);
+}
+
+/* fire and forget: "completed" / "stopped". Ctrl+C does not cancel them
+   (that is when "stopped" matters), only their own short timeout. */
 static void trackers_final(bt *b, int event)
 {
     int n = 0;
     for (int i = 0; i < b->ntr && n < 8; i++) {
         if (!b->tr[i].ok) continue;
-        if (job_start(b, announce_job(b, i, event), 0)) n++;
+        job *j = announce_job(b, i, event);
+        j->final = 1;
+        j->t->ignore_ctrl_c = 1;
+        InterlockedIncrement(&g_final_jobs);
+        if (job_start(b, j, 0)) n++;
+        else InterlockedDecrement(&g_final_jobs);
     }
 }
 
@@ -2784,6 +2941,14 @@ static const char *dht_router_names[] = {
     "router.bittorrent.com:6881", "router.utorrent.com:6881",
     "dht.transmissionbt.com:6881", "dht.libtorrent.org:25401",
 };
+
+#define DHT_NROUTERS ((int)(sizeof dht_router_names / sizeof *dht_router_names))
+
+/* helper threads to keep free for looking up the DHT routers */
+static int dht_wants_helpers(const bt *b)
+{
+    return b->dht_on && !b->d.resolved && !b->d.resolving ? DHT_NROUTERS : 0;
+}
 
 static int dht_closer(const uint8_t *target, const uint8_t *x, const uint8_t *y)  /* x closer than y? */
 {
@@ -2816,10 +2981,11 @@ static void dht_close(bt *b)
     b->dht_on = 0;
 }
 
-static void dht_query(bt *b, const baddr *a)
+/* 1 if the query went out */
+static int dht_query(bt *b, const baddr *a)
 {
     dht *d = &b->d;
-    if (d->npend >= DHT_PEND || a->fam != 4) return;
+    if (d->npend >= DHT_PEND || a->fam != 4) return 0;
     uint16_t tid = ++d->tid;
     uint8_t msg[128];
     size_t n = 0;
@@ -2835,13 +3001,14 @@ static void dht_query(bt *b, const baddr *a)
 #undef PUT
     struct sockaddr_storage ss;
     int sl = addr_to_sa(a, &ss);
-    if (sendto(d->s, (const char *)msg, (int)n, 0, (struct sockaddr *)&ss, sl) != (int)n) return;
+    if (sendto(d->s, (const char *)msg, (int)n, 0, (struct sockaddr *)&ss, sl) != (int)n) return 0;
     d->bound = 1;
     d->pend[d->npend].tid = tid;
     d->pend[d->npend].a = *a;
     d->pend[d->npend].t = b->now;
     d->npend++;
     d->queries++;
+    return 1;
 }
 
 static dnode *dht_find(dht *d, const baddr *a)
@@ -2930,14 +3097,15 @@ static void dht_tick(bt *b)
 {
     dht *d = &b->d;
     if (!b->dht_on) return;
-    if (!d->resolved && !d->resolving && b->now >= d->resolve_next) {
-        /* one lookup per router, so one slow name does not hold up the others */
-        for (size_t i = 0; i < sizeof dht_router_names / sizeof *dht_router_names && b->njobs < MAX_JOBS; i++) {
+    if (!d->resolved && !d->resolving && b->now >= d->resolve_next && b->njobs < MAX_JOBS) {
+        /* one lookup per router, so one slow name does not hold up the others
+           (with every helper busy, this waits for the next free one) */
+        for (int i = 0; i < DHT_NROUTERS && b->njobs < MAX_JOBS; i++) {
             job *j = job_new(b, JOB_RESOLVE);
             j->hosts[j->nhosts++] = xstrdup(dht_router_names[i]);
             if (job_start(b, j, 1)) d->resolving++;
         }
-        if (!d->resolving) d->resolve_next = b->now + 60;
+        if (!d->resolving) d->resolve_next = b->now + 60;        /* no thread could be started */
     }
     for (int i = 0; i < d->npend;) {                 /* timeouts */
         if (b->now - d->pend[i].t > 3.0) {
@@ -2965,7 +3133,7 @@ static void dht_tick(bt *b)
         for (int i = 0; i < d->nn && d->npend < DHT_ALPHA && window < 16; i++) {
             if (d->n[i].st == 3) continue;
             window++;
-            if (d->n[i].st == 0) { d->n[i].st = 1; dht_query(b, &d->n[i].a); }
+            if (d->n[i].st == 0 && dht_query(b, &d->n[i].a)) d->n[i].st = 1;   /* unsent: try again */
         }
         if ((d->npend == 0 && b->now - d->t_start > 1.0) || d->queries > 400 || b->now - d->t_start > 60) {
             d->searching = 0;
@@ -3005,6 +3173,15 @@ static void jobs_poll(bt *b)
         job_release(j);
         b->jobs[i] = b->jobs[--b->njobs];
     }
+}
+
+/* The DHT goes first: with many trackers their announces would otherwise
+   take every helper and hold up the DHT bootstrap. */
+static void helpers_tick(bt *b)
+{
+    jobs_poll(b);
+    dht_tick(b);
+    trackers_tick(b);
 }
 
 /* ================================================================== */
@@ -3126,7 +3303,7 @@ static int state_load(const char *path, const uint8_t ih[20], bt_state *st)
     size_t rl = d.n[in].end - d.n[in].off;
     uint8_t h[20];
     if (!sha1(raw, rl, h) || memcmp(h, ih, 20) != 0) goto out;
-    size_t nl, bl;
+    size_t nl = 0, bl = 0;
     const uint8_t *nm = be_str(&d, be_get(&d, 0, "name"), &nl);
     const uint8_t *bits = be_str(&d, be_get(&d, 0, "pieces"), &bl);
     if (!nm || !nl || !bits) goto out;
@@ -3242,6 +3419,24 @@ static int pick_top(bt *b, const char *state_name)
     return 0;
 }
 
+/* Is "<top>.ulbt" there and not ours? Then the name belongs to another
+   torrent's unfinished download (or to some other file): not ours to
+   overwrite, and neither are the files under that name. */
+static int state_foreign(bt *b)
+{
+    char *p = state_path_for(b);
+    int foreign = 0;
+    if (file_exists(p)) {
+        char head[47];
+        FILE *f = fopen_u8(p, "rb");
+        size_t n = f ? fread(head, 1, sizeof head, f) : 0;
+        if (f) fclose(f);
+        foreign = !(n == sizeof head && memcmp(head, "ULBT1 ", 6) == 0 && memcmp(head + 6, b->ihex, 40) == 0);
+    }
+    free(p);
+    return foreign;
+}
+
 /* a top name that is not taken: "name (2).ext" / "name (2)" */
 static void pick_unique_top(bt *b)
 {
@@ -3281,6 +3476,7 @@ static int setup_meta(bt *b, const char *state_name, const uint8_t *bits, size_t
 
     pick_top(b, state_name);
     int existing = !bits && file_exists(b->target);
+    int foreign = !bits && state_foreign(b);
     if (meta_layout(m, b->out_dir, b->top, err, sizeof err) != 0) { bt_fail(b, "%s", err); return -1; }
 
     int nfiles = 0;
@@ -3304,9 +3500,9 @@ static int setup_meta(bt *b, const char *state_name, const uint8_t *bits, size_t
         for (int i = 0; i < m->nfiles; i++) {      /* a file that changed size lost its pieces */
             bfile *f = &m->files[i];
             if (f->pad || f->len == 0 || file_size(f->path) == f->len) continue;
-            changed++;
-            int first = (int)(f->off / m->plen), last = (int)((f->off + f->len - 1) / m->plen);
-            for (int k = first; k <= last; k++) bit_clr(b->have, k);
+            int first = (int)(f->off / m->plen), last = (int)((f->off + f->len - 1) / m->plen), had = 0;
+            for (int k = first; k <= last; k++) { had |= bit_get(b->have, k); bit_clr(b->have, k); }
+            changed += had;                         /* (one never created yet lost nothing) */
         }
         for (int i = 0; i < np; i++)
             if (bit_get(b->have, i)) { b->nhave++; b->have_bytes += piece_len(b, i); }
@@ -3315,6 +3511,13 @@ static int setup_meta(bt *b, const char *state_name, const uint8_t *bits, size_t
         if (b->nhave)
             tlog(b->t, LOG_DIM, "  resuming at %.1f%% (%s already verified)", 100.0 * (double)b->have_bytes / (double)m->total,
                  fmt_size(b->have_bytes, a, sizeof a));
+    } else if (foreign) {
+        char *was = xstrdup(b->top);
+        pick_unique_top(b);
+        if (meta_layout(m, b->out_dir, b->top, err, sizeof err) != 0) { free(was); bt_fail(b, "%s", err); return -1; }
+        tlog(b->t, LOG_DIM, "  another torrent is being saved as %s - saving as %s", was, b->top);
+        free(was);
+        task_set_file(b->t, b->top, b->target);
     } else if (existing && !b->cfg->overwrite) {
         tlog(b->t, LOG_DIM, "  %s already exists - checking what is already there", b->top);
         if (recheck(b) == -2) return -2;
@@ -3331,7 +3534,14 @@ static int setup_meta(bt *b, const char *state_name, const uint8_t *bits, size_t
     b->start_bytes = b->have_bytes;
     free(b->state_path);
     b->state_path = state_path_for(b);
-    if (b->nhave == np) return 0;
+    if (b->nhave == np) {
+        /* complete: still give every file its exact size (cut what is past
+           the end, create missing empty files) */
+        int r = stor_prepare(m, b->t);
+        if (r == -2) return -2;
+        if (r != 0) tlog(b->t, LOG_WARN, "  %s", m->ioerr);
+        return 0;
+    }
 
     int64_t need = m->total - b->have_bytes, fr = disk_free(b->target);
     if (fr >= 0 && fr < need) {
@@ -3504,12 +3714,11 @@ static void tick(bt *b)
             peer *p = b->p[i];
             if (p->st == PS_ACTIVE && !p->dead && p->ut_md && p->md_size > 0 && p->md_size != b->md_size && p->md_bad < 3) other = 1;
         }
-        if (other) {
+        if (other) {                /* (otherwise look again next second: such a peer may come) */
             for (int i = 0; i < b->npeers; i++)
                 if (b->p[i]->md_size == b->md_size) b->p[i]->md_bad++;
             md_reset(b);
         }
-        b->t_md = b->now;
     }
     if (b->now - b->t_choke >= 10) { b->t_choke = b->now; rechoke(b); }
     if (b->now - b->t_prune >= 30) { b->t_prune = b->now; prune_peers(b); }
@@ -3682,9 +3891,7 @@ static int bt_main(bt *b)
         if (b->fatal) { rc = 1; break; }
         if (b->have_meta && b->nhave == b->m.np) { rc = 0; break; }
 
-        jobs_poll(b);
-        trackers_tick(b);
-        dht_tick(b);
+        helpers_tick(b);
         connect_more(b);
 
         net_poll(b, 50);
@@ -3704,7 +3911,7 @@ static int bt_main(bt *b)
 
         for (int i = b->npeers - 1; i >= 0; i--)
             if (b->p[i]->dead) peer_close(b, i);
-        for (int i = 0; i < b->npeers && !b->fatal; i++) {
+        for (int i = 0; i < b->npeers && !b->fatal && !task_aborted(t); i++) {
             peer *p = b->p[i];
             if (p->dead || p->st != PS_ACTIVE) continue;
             if (b->have_meta) {
@@ -3827,8 +4034,10 @@ int torrent_run(http_session *s, ul_config *cfg, const char *source, const unsig
         const char *bn = path_basename(sp);
         size_t bl = strlen(bn);
         if (bl > 5 && !str_iends(bn, ".ulbt")) bl = 0;
-        free(st.name);
-        st.name = bl > 5 ? xstrndup(bn, bl - 5) : xstrdup(st.name ? st.name : "");
+        if (bl > 5) {                       /* (a file named just ".ulbt": the name saved in it) */
+            free(st.name);
+            st.name = xstrndup(bn, bl - 5);
+        }
     }
     free(sp);
 

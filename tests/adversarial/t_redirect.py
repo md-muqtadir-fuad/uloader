@@ -47,7 +47,8 @@ def main():
         shutil.copy(FAKE, os.path.join(tools, "yt-dlp.exe"))
         ytout = os.path.join(d, "ytout.txt")
         media = A.url("/redir?to=" + urllib.parse.quote(b_url))
-        open(ytout, "wb").write(("ULVID\tbin\t\t\t{\"Cookie\": \"YTSECRET=1\", \"User-Agent\": \"x\"}\tclip [id]\n%s\n" % media).encode())
+        open(ytout, "wb").write(ulvid([media], ext="bin", headers={"Cookie": "YTSECRET=1", "User-Agent": "x"},
+                                      title="clip", vid="id").encode())
         env = {"PATH": tools + os.pathsep + os.environ["PATH"], "FAKE_YTDLP_OUT": ytout}
         rc, txt, el, to = run(["--ytdlp", "-d", out, "--overwrite", "https://video.example/watch?v=1"], out, 60, env=env)
         leak = [l for l in hdr_lines(B) if "YTSECRET" in l]

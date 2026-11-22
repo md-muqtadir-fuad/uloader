@@ -36,7 +36,7 @@ char *xasprintf(const char *fmt, ...)
     va_start(ap, fmt);
     int n = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
-    if (n < 0) n = 0;
+    if (n < 0) return xstrdup("");
     char *p = xmalloc((size_t)n + 1);
     va_start(ap, fmt);
     vsnprintf(p, (size_t)n + 1, fmt, ap);
@@ -69,11 +69,17 @@ char *w_to_u8(const wchar_t *w)
 wchar_t *wpath(const char *p)
 {
     wchar_t *w = u8_to_w(p);
-    if (wcslen(w) < 240 || wcsncmp(w, L"\\\\?\\", 4) == 0) return w;
+    /* already a device / long path ("\\?\", "\\.\", "//?/", "//./"): leave it alone */
+    if ((w[0] == L'\\' || w[0] == L'/') && (w[1] == L'\\' || w[1] == L'/') &&
+        (w[2] == L'?' || w[2] == L'.') && (w[3] == L'\\' || w[3] == L'/'))
+        return w;
+    if (wcslen(w) < 200) return w;                 /* short even when made absolute? check below */
     DWORD n = GetFullPathNameW(w, 0, NULL, NULL);
     if (!n) return w;
     wchar_t *full = xmalloc(((size_t)n + 1) * sizeof(wchar_t));
-    if (!GetFullPathNameW(w, n + 1, full, NULL)) { free(full); return w; }
+    DWORD m = GetFullPathNameW(w, n + 1, full, NULL);
+    if (!m || m > n) { free(full); return w; }     /* changed under us: use as given */
+    if (wcslen(full) < 240) { free(full); return w; }
     free(w);
     wchar_t *r;
     if (full[0] == L'\\' && full[1] == L'\\') {      /* \\server\share -> \\?\UNC\server\share */
@@ -89,20 +95,26 @@ wchar_t *wpath(const char *p)
     return r;
 }
 
+/* Strict UTF-8: no overlong forms, no UTF-16 surrogates, nothing above U+10FFFF. */
 int utf8_valid(const unsigned char *s, size_t n)
 {
     size_t i = 0;
     while (i < n) {
         unsigned char c = s[i];
         int extra;
+        unsigned cp, min;
         if (c < 0x80) { i++; continue; }
-        else if ((c & 0xE0) == 0xC0) extra = 1;
-        else if ((c & 0xF0) == 0xE0) extra = 2;
-        else if ((c & 0xF8) == 0xF0) extra = 3;
+        else if ((c & 0xE0) == 0xC0) { extra = 1; cp = c & 0x1F; min = 0x80; }
+        else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0F; min = 0x800; }
+        else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07; min = 0x10000; }
         else return 0;
         if (i + (size_t)extra >= n) return 0;
-        for (int k = 1; k <= extra; k++)
-            if ((s[i + (size_t)k] & 0xC0) != 0x80) return 0;
+        for (int k = 1; k <= extra; k++) {
+            unsigned char cc = s[i + (size_t)k];
+            if ((cc & 0xC0) != 0x80) return 0;
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return 0;
         i += (size_t)extra + 1;
     }
     return 1;
@@ -113,9 +125,11 @@ int utf8_valid(const unsigned char *s, size_t n)
 /* ------------------------------------------------------------------ */
 static void sb_grow(sbuf *b, size_t add)
 {
-    if (b->len + add + 1 <= b->cap) return;
-    size_t nc = b->cap ? b->cap * 2 : 256;
-    while (nc < b->len + add + 1) nc *= 2;
+    if (add > SIZE_MAX / 2 - b->len - 1) die_oom();      /* no size_t wrap-around */
+    size_t need = b->len + add + 1;
+    if (need <= b->cap) return;
+    size_t nc = b->cap ? b->cap : 256;
+    while (nc < need) nc = nc > SIZE_MAX / 4 ? need : nc * 2;
     b->s = xrealloc(b->s, nc);
     b->cap = nc;
 }
@@ -178,10 +192,14 @@ const char *str_istr(const char *hay, const char *needle)
     return NULL;
 }
 
+/* Trims in place and returns s itself (never a pointer into the middle):
+   callers may free() what they passed in. */
 char *str_trim(char *s)
 {
-    while (*s && isspace((unsigned char)*s)) s++;
-    size_t n = strlen(s);
+    size_t lead = 0;
+    while (s[lead] && isspace((unsigned char)s[lead])) lead++;
+    size_t n = strlen(s + lead);
+    if (lead) memmove(s, s + lead, n + 1);
     while (n && isspace((unsigned char)s[n - 1])) s[--n] = 0;
     return s;
 }
@@ -200,35 +218,43 @@ const char *fmt_size(int64_t n, char *buf, size_t len)
 
 const char *fmt_eta(double sec, char *buf, size_t len)
 {
-    if (sec < 0 || sec > 99.0 * 3600) { snprintf(buf, len, "--:--"); return buf; }
+    if (!(sec >= 0 && sec <= 99.0 * 3600)) { snprintf(buf, len, "--:--"); return buf; }   /* also NaN */
     long s = (long)(sec + 0.5);
     if (s >= 3600) snprintf(buf, len, "%ld:%02ld:%02ld", s / 3600, (s / 60) % 60, s % 60);
     else snprintf(buf, len, "%02ld:%02ld", s / 60, s % 60);
     return buf;
 }
 
+/* "500K", "2M", "1.5G", "800" (bytes), optional trailing "B" / "/s" */
 int64_t parse_size(const char *s)
 {
+    if (!isdigit((unsigned char)*s) && *s != '.') return -1;      /* no "nan", "inf", "-1" */
     char *end;
     double v = strtod(s, &end);
-    if (end == s || v < 0) return -1;
+    if (end == s || !(v >= 0) || v > 1e15) return -1;
     switch (toupper((unsigned char)*end)) {
-    case 'K': v *= 1024.0; break;
-    case 'M': v *= 1048576.0; break;
-    case 'G': v *= 1073741824.0; break;
-    case 0: case 'B': break;
-    default: return -1;
+    case 'K': v *= 1024.0; end++; break;
+    case 'M': v *= 1048576.0; end++; break;
+    case 'G': v *= 1073741824.0; end++; break;
+    default: break;
     }
+    if (toupper((unsigned char)*end) == 'B') end++;
+    if (end[0] == '/' && tolower((unsigned char)end[1]) == 's') end += 2;
+    if (*end) return -1;                                          /* "10Mfoo" */
     return (int64_t)v;
 }
 
 double now_sec(void)
 {
-    static LARGE_INTEGER freq;
+    static volatile LONG64 freq;
     LARGE_INTEGER c;
-    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    if (!freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        InterlockedExchange64(&freq, f.QuadPart);
+    }
     QueryPerformanceCounter(&c);
-    return (double)c.QuadPart / (double)freq.QuadPart;
+    return (double)c.QuadPart / (double)freq;
 }
 
 const char *win_errstr(DWORD code, char *buf, size_t len)
@@ -418,11 +444,38 @@ void json_put_string(sbuf *b, const char *s)
 /* ------------------------------------------------------------------ */
 int host_matches(const char *host, const char *domain)
 {
-    if (!host || !domain || !*domain) return 0;
+    if (!host || !domain || !*host) return 0;
     if (*domain == '.') domain++;
     size_t hl = strlen(host), dl = strlen(domain);
+    /* "" / "." / "com." / "..com" are never valid cookie domains */
+    if (!dl || domain[0] == '.' || domain[dl - 1] == '.' || host[hl - 1] == '.') return 0;
     if (hl == dl) return _stricmp(host, domain) == 0;
     return hl > dl && host[hl - dl - 1] == '.' && _stricmp(host + hl - dl, domain) == 0;
+}
+
+/* "https://Example.com/x" -> "https://example.com:443": scheme + host + port,
+   the unit credentials belong to (a downgrade to http or another port is
+   a different origin) */
+char *url_origin(const char *url)
+{
+    char *host = url_host(url);
+    const char *se = strstr(url, "://");
+    size_t sl = se ? (size_t)(se - url) : 0;
+    char scheme[16] = "";
+    for (size_t i = 0; i < sl && i < sizeof scheme - 1; i++) scheme[i] = (char)tolower((unsigned char)url[i]);
+    const char *a = se ? se + 3 : url;
+    size_t al = strcspn(a, "/?#");
+    const char *at = NULL;
+    for (size_t i = 0; i < al; i++) if (a[i] == '@') at = a + i;
+    if (at) { al -= (size_t)(at + 1 - a); a = at + 1; }
+    const char *colon = NULL;
+    const char *rb = memchr(a, ']', al);
+    for (const char *q = rb ? rb : a; q < a + al; q++) if (*q == ':') colon = q;
+    long port = colon ? strtol(colon + 1, NULL, 10) : 0;
+    if (port <= 0) port = !strcmp(scheme, "https") ? 443 : !strcmp(scheme, "ftp") ? 21 : 80;
+    char *r = xasprintf("%s://%s:%ld", scheme, host, port);
+    free(host);
+    return r;
 }
 
 /* Netscape cookies.txt: domain, include-subdomains, path, secure, expiry, name, value */
@@ -478,12 +531,14 @@ int cookies_load(ul_config *cfg, const char *path)
     return added;
 }
 
-char *cookie_header_for(const ul_config *cfg, const char *url)
+/* include_raw: also the -b "a=b" cookie (only to its own origin) */
+char *cookie_header_for(const ul_config *cfg, const char *url, int include_raw)
 {
     char *host = url_host(url);
     sbuf b = { 0 };
     int https = str_istarts(url, "https://");
-    if (cfg->cookie && *cfg->cookie && (!cfg->cookie_host || host_matches(host, cfg->cookie_host)))
+    if (include_raw && cfg->cookie && *cfg->cookie && !strpbrk(cfg->cookie, "\r\n") &&
+        (!cfg->cookie_host || host_matches(host, cfg->cookie_host)))
         sb_puts(&b, cfg->cookie);
     if (cfg->ncookies) {
         const char *ps = strstr(url, "://");
@@ -500,6 +555,8 @@ char *cookie_header_for(const ul_config *cfg, const char *url)
             size_t cpl = strlen(c->path);
             if (strncmp(path, c->path, cpl) != 0) continue;
             if (cpl && c->path[cpl - 1] != '/' && path[cpl] && path[cpl] != '/') continue;
+            /* one malformed cookie must not break the whole header */
+            if (!*c->name || strpbrk(c->name, "\r\n;= \t") || strpbrk(c->value, "\r\n;")) continue;
             if (b.len) sb_puts(&b, "; ");
             sb_printf(&b, "%s=%s", c->name, c->value);
         }
@@ -634,30 +691,34 @@ char *url_filename(const char *url)
     return dec;
 }
 
-/* Remove "." and ".." segments from an absolute path (RFC 3986 5.2.4). */
+/* Remove "." and ".." segments from an absolute path (RFC 3986 5.2.4).
+   Empty segments ("a//b") are kept: some signed CDN / S3 links need them. */
 static void append_normalized_path(sbuf *out, const char *path, size_t plen)
 {
-    sbuf b = { 0 };
-    size_t i = 0;
-    int trailing = 0;
-    while (i < plen) {
-        if (path[i] == '/') { i++; continue; }
+    sbuf b = { 0 };                        /* "/seg/seg..." without trailing slash */
+    size_t i = (plen && path[0] == '/') ? 1 : 0;
+    int trailing = plen == 0 || (plen == 1 && path[0] == '/');
+    while (i <= plen) {
         size_t s = i;
         while (i < plen && path[i] != '/') i++;
         size_t sl = i - s;
-        trailing = (i >= plen) ? 0 : 1;
-        if (sl == 1 && path[s] == '.') { trailing = 1; continue; }
-        if (sl == 2 && path[s] == '.' && path[s + 1] == '.') {
+        int last = i >= plen;
+        if (sl == 1 && path[s] == '.') {
+            trailing = last;
+        } else if (sl == 2 && path[s] == '.' && path[s + 1] == '.') {
             while (b.len && b.s[b.len - 1] != '/') b.len--;
-            if (b.len) b.len--;
+            if (b.len) b.len--;                /* drop the segment and its '/' */
             if (b.s) b.s[b.len] = 0;
+            trailing = last;
+        } else if (!(last && sl == 0)) {       /* a trailing '/' is not a segment */
+            sb_putc(&b, '/');
+            sb_putn(&b, path + s, sl);
+            trailing = 0;
+        } else {
             trailing = 1;
-            continue;
         }
-        sb_putc(&b, '/');
-        sb_putn(&b, path + s, sl);
+        i++;                                   /* past the '/' */
     }
-    if (plen && path[plen - 1] == '/') trailing = 1;
     if (!b.len || trailing) sb_putc(&b, '/');
     sb_putn(out, b.s, b.len);
     sb_free(&b);
@@ -788,8 +849,9 @@ const char *ext_for_content_type(const char *ct)
         { "text/plain", ".txt" }, { "text/html", ".html" }, { "text/csv", ".csv" },
     };
     if (!ct) return "";
+    size_t tl = strcspn(ct, "; \t");                     /* the type itself, without parameters */
     for (size_t i = 0; i < sizeof map / sizeof *map; i++)
-        if (str_istarts(ct, map[i].ct)) return map[i].ext;
+        if (strlen(map[i].ct) == tl && _strnicmp(ct, map[i].ct, tl) == 0) return map[i].ext;
     return "";
 }
 
@@ -859,35 +921,53 @@ int64_t file_size(const char *p)
     return ((int64_t)d.nFileSizeHigh << 32) | d.nFileSizeLow;
 }
 
-/* "Wed, 23 Sep 2026 14:33:02 GMT" (RFC 1123, what servers send) -> FILETIME */
-int http_date_to_filetime(const char *s, FILETIME *ft)
+/* Which version of the server's file a finished download is, kept in a
+   hidden NTFS stream "<file>:uloader.meta". The file's dates stay the
+   time it was downloaded, and its contents are untouched. (On FAT/exFAT
+   drives there are no streams; then nothing is recorded.) */
+static wchar_t *meta_stream_path(const char *p)
 {
-    static const char *mon[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    int d, y, H, M, S;
-    char m[4] = "";
-    if (!s || sscanf(s, "%*[^,], %d %3s %d %d:%d:%d", &d, m, &y, &H, &M, &S) != 6) return 0;
-    SYSTEMTIME st;
-    memset(&st, 0, sizeof st);
-    for (int i = 0; i < 12; i++) if (_stricmp(m, mon[i]) == 0) st.wMonth = (WORD)(i + 1);
-    if (!st.wMonth || y < 1980 || y > 9999 || d < 1 || d > 31 || H > 23 || M > 59 || S > 60) return 0;
-    st.wYear = (WORD)y; st.wDay = (WORD)d; st.wHour = (WORD)H; st.wMinute = (WORD)M; st.wSecond = (WORD)(S > 59 ? 59 : S);
-    return SystemTimeToFileTime(&st, ft) ? 1 : 0;
+    char *s = xasprintf("%s:uloader.meta", p);
+    wchar_t *w = wpath(s);
+    free(s);
+    return w;
 }
 
-/* 1 if the file's modification time equals ft (within 2 s), 0 if not, -1 if unknown */
-int file_mtime_equals(const char *p, const FILETIME *ft)
+void file_meta_write(const char *p, const char *etag, const char *lastmod)
 {
-    WIN32_FILE_ATTRIBUTE_DATA d;
-    wchar_t *w = wpath(p);
-    BOOL ok = GetFileAttributesExW(w, GetFileExInfoStandard, &d);
+    if ((!etag || !*etag) && (!lastmod || !*lastmod)) return;
+    wchar_t *w = meta_stream_path(p);
+    HANDLE h = CreateFileW(w, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     free(w);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char *txt = xasprintf("etag=%s\nlastmod=%s\n", etag && !strpbrk(etag, "\r\n") ? etag : "",
+                          lastmod && !strpbrk(lastmod, "\r\n") ? lastmod : "");
+    DWORD wr;
+    WriteFile(h, txt, (DWORD)strlen(txt), &wr, NULL);
+    CloseHandle(h);
+    free(txt);
+}
+
+/* 1 = same version as the server reports, 0 = a different one, -1 = cannot tell */
+int file_meta_matches(const char *p, const char *etag, const char *lastmod)
+{
+    wchar_t *w = meta_stream_path(p);
+    HANDLE h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    free(w);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    char buf[2048];
+    DWORD n = 0;
+    BOOL ok = ReadFile(h, buf, sizeof buf - 1, &n, NULL);
+    CloseHandle(h);
     if (!ok) return -1;
-    ULARGE_INTEGER a, b;
-    a.LowPart = d.ftLastWriteTime.dwLowDateTime; a.HighPart = d.ftLastWriteTime.dwHighDateTime;
-    b.LowPart = ft->dwLowDateTime;               b.HighPart = ft->dwHighDateTime;
-    uint64_t diff = a.QuadPart > b.QuadPart ? a.QuadPart - b.QuadPart : b.QuadPart - a.QuadPart;
-    return diff <= 20000000ULL;                  /* 2 s in 100 ns units */
+    buf[n] = 0;
+    char *e = strstr(buf, "etag="), *l = strstr(buf, "lastmod=");
+    char se[1024] = "", sl[1024] = "";
+    if (e) snprintf(se, sizeof se, "%.*s", (int)strcspn(e + 5, "\n"), e + 5);
+    if (l) snprintf(sl, sizeof sl, "%.*s", (int)strcspn(l + 8, "\n"), l + 8);
+    if (etag && *etag && *se) return strcmp(etag, se) == 0;
+    if (lastmod && *lastmod && *sl) return strcmp(lastmod, sl) == 0;
+    return -1;
 }
 
 int file_delete(const char *p)
@@ -914,15 +994,21 @@ int dir_create(const char *p)
     DWORD n = GetFullPathNameW(w, 0, NULL, NULL);
     if (!n) { free(w); return -1; }
     wchar_t *full = xmalloc(((size_t)n + 1) * sizeof(wchar_t));
-    GetFullPathNameW(w, n + 1, full, NULL);
+    DWORD m = GetFullPathNameW(w, n + 1, full, NULL);
     free(w);
+    if (!m || m > n) { free(full); return -1; }
     size_t len = wcslen(full);
-    /* first component that can be created: after "C:\" or "\\server\share\" */
-    size_t start = 3;
-    if (full[0] == L'\\' && full[1] == L'\\') {
-        int seps = 0;
-        for (start = 2; start < len && seps < 2; start++) if (full[start] == L'\\') seps++;
+    /* first component that can be created: after "C:\", "\\server\share\",
+       "\\?\C:\" or "\\?\UNC\server\share\" */
+    size_t start = 3, skip_seps = 0, from = 0;
+    if (wcsncmp(full, L"\\\\?\\UNC\\", 8) == 0) { from = 8; skip_seps = 2; }
+    else if (wcsncmp(full, L"\\\\?\\", 4) == 0) { start = 7; }
+    else if (full[0] == L'\\' && full[1] == L'\\') { from = 2; skip_seps = 2; }
+    if (skip_seps) {
+        size_t seps = 0;
+        for (start = from; start < len && seps < skip_seps; start++) if (full[start] == L'\\') seps++;
     }
+    if (start > len) start = len;
     int rc = 0;
     for (size_t i = start; i <= len && rc == 0; i++) {
         if (i == len || full[i] == L'\\' || full[i] == L'/') {
@@ -995,10 +1081,14 @@ char *unique_path(const char *path)
 int64_t disk_free(const char *path)
 {
     char *dir = path_dirname(path);
-    wchar_t *w = u8_to_w(dir);
+    size_t dl = strlen(dir);
+    /* a share root like \\server\share needs its trailing backslash */
+    char *d2 = (dl && dir[dl - 1] != '\\' && dir[dl - 1] != '/') ? xasprintf("%s\\", dir) : xstrdup(dir);
+    wchar_t *w = wpath(d2);
     ULARGE_INTEGER freeb;
     BOOL ok = GetDiskFreeSpaceExW(w, &freeb, NULL, NULL);
     free(w);
+    free(d2);
     free(dir);
     return ok ? (int64_t)freeb.QuadPart : -1;
 }
@@ -1009,7 +1099,7 @@ char *exe_dir(void)
     DWORD n = GetModuleFileNameW(NULL, buf, MAX_PATH * 4);
     if (!n || n >= MAX_PATH * 4) return xstrdup(".");
     while (n > 0 && buf[n - 1] != L'\\' && buf[n - 1] != L'/') n--;
-    if (n > 0) n--;
+    if (n > 0 && !(n == 3 && buf[1] == L':')) n--;     /* keep "C:\" whole */
     buf[n] = 0;
     return w_to_u8(buf);
 }
@@ -1082,7 +1172,8 @@ static char *registry_path(void)
             raw[size / sizeof(wchar_t)] = 0;
             DWORD n = ExpandEnvironmentStringsW(raw, NULL, 0);
             wchar_t *ex = xmalloc(((size_t)n + 1) * sizeof(wchar_t));
-            if (n && ExpandEnvironmentStringsW(raw, ex, n + 1)) {
+            DWORD m = n ? ExpandEnvironmentStringsW(raw, ex, n + 1) : 0;
+            if (m && m <= n + 1) {
                 char *u = w_to_u8(ex);
                 if (all.len) sb_putc(&all, ';');
                 sb_puts(&all, u);
@@ -1107,11 +1198,13 @@ char *find_tool(const char *name)
     DWORD n = GetEnvironmentVariableW(L"PATH", NULL, 0);
     if (n) {
         wchar_t *wp = xmalloc((size_t)n * sizeof(wchar_t));
-        GetEnvironmentVariableW(L"PATH", wp, n);
-        char *path = w_to_u8(wp);
+        DWORD m = GetEnvironmentVariableW(L"PATH", wp, n);
+        if (m && m < n) {                      /* else it changed meanwhile: skip */
+            char *path = w_to_u8(wp);
+            found = search_path_list(path, name);
+            free(path);
+        }
         free(wp);
-        found = search_path_list(path, name);
-        free(path);
     }
     if (!found) {
         char *rp = registry_path();
@@ -1144,32 +1237,64 @@ void cmd_append_arg(sbuf *b, const char *a)
     sb_putc(b, '"');
 }
 
-/* Run a program, collect its stdout+stderr, and kill it if the task is
-   paused. With no console (GUI) the child gets no window either.
-   Returns the exit code, or -1 if it could not start / was cancelled. */
+/* Run a program, collect its stdout+stderr, and stop it if the task is
+   paused. The child runs in a job object, so stopping it also stops
+   everything it started (yt-dlp's onefile build runs itself again as a
+   child, which may start deno). With no console (GUI) the child gets no
+   window. Only the pipe and NUL are inherited - not the handles other
+   downloads have open. Output beyond 16 MB is drained but not kept.
+   Returns the exit code, or RUN_FAILED if it could not start or was stopped. */
 int run_process(const char *cmdline, char **captured, const ul_task *t)
 {
+    const size_t keep_max = (size_t)16 << 20;
     SECURITY_ATTRIBUTES sa = { sizeof sa, NULL, TRUE };
-    HANDLE rd = NULL, wr = NULL, nul;
-    STARTUPINFOW si;
+    HANDLE rd = NULL, wr = NULL, nul, job;
     PROCESS_INFORMATION pi;
     if (captured) *captured = NULL;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) return -1;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) return RUN_FAILED;
     SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
     nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+
+    STARTUPINFOEXW si;
     ZeroMemory(&si, sizeof si);
-    si.cb = sizeof si;
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = wr;
-    si.hStdError = wr;
-    si.hStdInput = nul;
-    DWORD flags = GetConsoleWindow() ? 0 : CREATE_NO_WINDOW;
+    si.StartupInfo.cb = sizeof si;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdOutput = wr;
+    si.StartupInfo.hStdError = wr;
+    si.StartupInfo.hStdInput = nul;
+    HANDLE inherit[2] = { wr, nul };
+    int ninherit = nul != INVALID_HANDLE_VALUE ? 2 : 1;
+    SIZE_T asize = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &asize);
+    si.lpAttributeList = xmalloc(asize);
+    BOOL have_list = InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &asize) &&
+                     UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                               inherit, sizeof(HANDLE) * (size_t)ninherit, NULL, NULL);
+
+    job = CreateJobObjectW(NULL, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li;
+        ZeroMemory(&li, sizeof li);
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li);
+    }
+
+    DWORD flags = (GetConsoleWindow() ? 0 : CREATE_NO_WINDOW) | CREATE_SUSPENDED |
+                  (have_list ? EXTENDED_STARTUPINFO_PRESENT : 0);
     wchar_t *w = u8_to_w(cmdline);
-    BOOL ok = CreateProcessW(NULL, w, NULL, NULL, TRUE, flags, NULL, NULL, &si, &pi);
+    BOOL ok = CreateProcessW(NULL, w, NULL, NULL, TRUE, flags, NULL, NULL, &si.StartupInfo, &pi);
     free(w);
+    if (have_list) DeleteProcThreadAttributeList(si.lpAttributeList);
+    free(si.lpAttributeList);
     CloseHandle(wr);
     if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
-    if (!ok) { CloseHandle(rd); return -1; }
+    if (!ok) {
+        CloseHandle(rd);
+        if (job) CloseHandle(job);
+        return RUN_FAILED;
+    }
+    if (job && !AssignProcessToJobObject(job, pi.hProcess)) { CloseHandle(job); job = NULL; }
+    ResumeThread(pi.hThread);
 
     sbuf b = { 0 };
     char buf[8192];
@@ -1177,18 +1302,19 @@ int run_process(const char *cmdline, char **captured, const ul_task *t)
     for (;;) {
         DWORD avail = 0, n = 0;
         if (PeekNamedPipe(rd, NULL, 0, NULL, &avail, NULL) && avail) {
-            if (ReadFile(rd, buf, avail < sizeof buf ? avail : sizeof buf, &n, NULL) && n)
+            if (ReadFile(rd, buf, avail < sizeof buf ? avail : sizeof buf, &n, NULL) && n && b.len < keep_max)
                 sb_putn(&b, buf, n);
             continue;
         }
         if (WaitForSingleObject(pi.hProcess, 50) == WAIT_OBJECT_0) {
             while (PeekNamedPipe(rd, NULL, 0, NULL, &avail, NULL) && avail &&
                    ReadFile(rd, buf, avail < sizeof buf ? avail : sizeof buf, &n, NULL) && n)
-                sb_putn(&b, buf, n);
+                if (b.len < keep_max) sb_putn(&b, buf, n);
             break;
         }
         if (!killed && task_aborted(t)) {
-            TerminateProcess(pi.hProcess, 1);
+            if (job) TerminateJobObject(job, 1);           /* the whole tree */
+            else TerminateProcess(pi.hProcess, 1);
             killed = 1;
         }
     }
@@ -1197,10 +1323,15 @@ int run_process(const char *cmdline, char **captured, const ul_task *t)
     GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    if (job) CloseHandle(job);                              /* ends any leftover grandchild */
     if (captured) *captured = sb_steal(&b);
     else sb_free(&b);
-    return killed ? -1 : (int)code;
+    return killed ? RUN_FAILED : (int)code;
 }
+
+/* ffmpeg reads "file:" paths literally: a name starting with "-" can never
+   be mistaken for an option */
+static char *ffmpeg_path(const char *p) { return xasprintf("file:%s", p); }
 
 static int run_ffmpeg(const char *ff, const char **args, size_t nargs, const char *out, const ul_task *t)
 {
@@ -1212,7 +1343,7 @@ static int run_ffmpeg(const char *ff, const char **args, size_t nargs, const cha
     sb_free(&c);
     if (r != 0) {
         file_delete(out);
-        if (log && *log && r > 0) {
+        if (log && *log && r != RUN_FAILED) {
             char *last = str_trim(log);
             char *nl = strrchr(last, '\n');
             tlog((ul_task *)t, LOG_DIM, "  ffmpeg: %s", nl ? nl + 1 : last);
@@ -1224,16 +1355,22 @@ static int run_ffmpeg(const char *ff, const char **args, size_t nargs, const cha
 
 int ffmpeg_merge(const char *ff, const char *video, const char *audio, const char *out, const ul_task *t)
 {
-    const char *args[] = { "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", video, "-i", audio,
-                           "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", out };
-    return run_ffmpeg(ff, args, sizeof args / sizeof *args, out, t);
+    char *v = ffmpeg_path(video), *a = ffmpeg_path(audio), *o = ffmpeg_path(out);
+    const char *args[] = { "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", v, "-i", a,
+                           "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", o };
+    int r = run_ffmpeg(ff, args, sizeof args / sizeof *args, out, t);
+    free(v); free(a); free(o);
+    return r;
 }
 
 int ffmpeg_remux(const char *ff, const char *in, const char *out, const ul_task *t)
 {
-    const char *args[] = { "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", in,
-                           "-map", "0:v?", "-map", "0:a?", "-c", "copy", out };
-    return run_ffmpeg(ff, args, sizeof args / sizeof *args, out, t);
+    char *i = ffmpeg_path(in), *o = ffmpeg_path(out);
+    const char *args[] = { "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", i,
+                           "-map", "0:v?", "-map", "0:a?", "-c", "copy", o };
+    int r = run_ffmpeg(ff, args, sizeof args / sizeof *args, out, t);
+    free(i); free(o);
+    return r;
 }
 
 /* ------------------------------------------------------------------ */

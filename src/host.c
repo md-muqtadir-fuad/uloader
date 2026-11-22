@@ -40,11 +40,23 @@ static int read_exact(HANDLE h, void *buf, DWORD n)
     return 1;
 }
 
+/* all n bytes, or 0: a pipe may take a message in several pieces */
+static int write_all(HANDLE h, const void *buf, DWORD n)
+{
+    const char *p = buf;
+    while (n) {
+        DWORD w = 0;
+        if (!WriteFile(h, p, n, &w, NULL) || w == 0) return 0;
+        p += w;
+        n -= w;
+    }
+    return 1;
+}
+
 static int write_msg(HANDLE h, const char *json)
 {
     uint32_t len = (uint32_t)strlen(json);
-    DWORD w;
-    return WriteFile(h, &len, 4, &w, NULL) && WriteFile(h, json, len, &w, NULL);
+    return write_all(h, &len, 4) && write_all(h, json, len);
 }
 
 static char *exe_path(void)
@@ -64,7 +76,7 @@ static char *write_cookie_file(const char *msg)
     if (!GetTempPathW(MAX_PATH + 1, tdir) || !GetTempFileNameW(tdir, L"ulc", 0, tfile)) return NULL;
     char *path = w_to_u8(tfile);
     FILE *f = fopen_u8(path, "wb");
-    if (!f) { free(path); return NULL; }
+    if (!f) { file_delete(path); free(path); return NULL; }   /* GetTempFileName created it */
     fputs("# Netscape HTTP Cookie File\n", f);
     int count = 0;
     const char *p = arr + 1;
@@ -79,17 +91,24 @@ static char *write_cookie_file(const char *msg)
         char *host_only = json_str(json_find(obj, "hostOnly"));
         char *secure = json_str(json_find(obj, "secure"));
         char *exp = json_str(json_find(obj, "expirationDate"));
-        int bad = !domain || !*domain || !name || !value ||
+        /* a domain must name a host: not "." / "..", and never start with
+           '#' (that line would be a comment, or "#HttpOnly_" something) */
+        const char *bare = domain ? domain + strspn(domain, ".") : "";
+        int bad = !domain || !*bare || *domain == '#' || !name || !value ||
                   strpbrk(domain, "\t\r\n ") || strpbrk(name, "\t\r\n") || strpbrk(value, "\t\r\n") ||
                   (cpath && strpbrk(cpath, "\t\r\n"));
         if (!bad && count < 2000) {
             int ho = host_only && !strcmp(host_only, "true");
             const char *d = domain;
             if (ho && *d == '.') d++;
+            /* expiry in seconds; NaN / negative / absurd values must not
+               reach the (undefined) double -> integer conversion */
+            double ev = exp ? strtod(exp, NULL) : 0.0;
+            long long expires = (ev > 0 && ev < 253402300800.0) ? (long long)ev : (ev >= 253402300800.0 ? 253402300799LL : 0LL);
             fprintf(f, "%s%s\t%s\t%s\t%s\t%lld\t%s\t%s\n", (!ho && *d != '.') ? "." : "", d,
                     ho ? "FALSE" : "TRUE", cpath && *cpath ? cpath : "/",
                     secure && !strcmp(secure, "true") ? "TRUE" : "FALSE",
-                    exp ? (long long)strtod(exp, NULL) : 0LL, name, value);
+                    expires, name, value);
             count++;
         }
         free(domain); free(cpath); free(name); free(value); free(host_only); free(secure); free(exp);
@@ -99,8 +118,9 @@ static char *write_cookie_file(const char *msg)
         if (*p != ',') break;
         p++;
     }
-    fclose(f);
-    if (!count) { file_delete(path); free(path); return NULL; }
+    int wok = !ferror(f);
+    if (fclose(f) != 0) wok = 0;
+    if (!count || !wok) { file_delete(path); free(path); return NULL; }
     return path;
 }
 
@@ -223,8 +243,11 @@ static const char *deliver_job(const char *job)
         cds.cbData = (DWORD)strlen(job) + 1;
         cds.lpData = (void *)job;
         DWORD_PTR res = 0;
-        if (SendMessageTimeoutW(hw, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG, 5000, &res) && res)
-            return "gui";
+        /* 1 = taken, 2 = refused (unreadable job), 0 = the window is closing */
+        if (SendMessageTimeoutW(hw, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG, 5000, &res)) {
+            if (res == 1) return "gui";
+            if (res == 2) return NULL;
+        }
     }
     char *dir = exe_dir();
     char *gui = path_join(dir, UL_GUI_EXE);
@@ -240,6 +263,46 @@ static const char *deliver_job(const char *job)
     free(gui);
     free(self);
     return via;
+}
+
+/* Before taking a download over from the browser: can U-loader really get
+   it? Asks for the first byte with the browser's cookies, referer and
+   identity. A refusal (403, 401...) or a web page instead of the file
+   (a login wall) means "no" - the browser then keeps its own download. */
+static int verify_download(const char *url, const char *ref, const char *ua, const char *cookie_file,
+                           const char *filename, int *status, char *err, size_t errlen)
+{
+    *status = 0;
+    err[0] = 0;
+    if (!str_istarts(url, "http://") && !str_istarts(url, "https://")) return 1;   /* ftp/magnet: no probe */
+    ul_config *cfg = xcalloc(1, sizeof *cfg);
+    cfg_defaults(cfg);
+    cfg->timeout_sec = 15;
+    if (ref && *ref) cfg->referer = xstrdup(ref);
+    if (ua && *ua) cfg->user_agent = xstrdup(ua);
+    if (cookie_file) cookies_load(cfg, cookie_file);
+    ul_task *t = task_new(url);
+    http_session *s = http_session_new(cfg, t);
+    int ok = 0;
+    if (s) {
+        http_session_set_origin(s, url);
+        http_response r;
+        if (http_request(s, url, NULL, 0, 0, 0, &r, err, errlen) == 0) {
+            *status = r.status;
+            int page = r.content_type && str_istarts(r.content_type, "text/html") &&
+                       !(filename && (str_iends(filename, ".html") || str_iends(filename, ".htm")));
+            ok = (r.status == 200 || r.status == 206) && !page;
+            if (page && ok == 0 && (r.status == 200 || r.status == 206))
+                snprintf(err, errlen, "the server sent a web page instead of the file (sign-in needed?)");
+            else if (!ok)
+                snprintf(err, errlen, "the server refused U-loader (HTTP %d)", r.status);
+            http_close(&r);
+        }
+        http_session_free(s);
+    }
+    task_free(t);
+    cfg_free(cfg);
+    return ok;
 }
 
 static int url_allowed(const char *u)
@@ -272,10 +335,26 @@ static void handle(const char *msg, sbuf *resp)
             char *conn = json_str(json_find(msg, "connections"));
             char *qual = json_str(json_find(msg, "quality"));
             char *cookies = write_cookie_file(msg);
+            char *verify = json_str(json_find(msg, "verify"));
             if (mode && strcmp(mode, "auto") && strcmp(mode, "direct") && strcmp(mode, "ytdlp")) {
                 free(mode);
                 mode = NULL;
             }
+            int status = 0;
+            char verr[256] = "";
+            if (verify && !strcmp(verify, "true") &&
+                !verify_download(url, ref, ua, cookies, name, &status, verr, sizeof verr)) {
+                /* the browser keeps this download */
+                if (cookies) file_delete(cookies);
+                sb_puts(resp, "{\"ok\":false,\"error\":");
+                json_put_string(resp, verr[0] ? verr : "U-loader cannot get this file");
+                sb_printf(resp, ",\"status\":%d}", status);
+                free(verify); free(mode); free(ref); free(ua); free(name); free(dir);
+                free(conn); free(qual); free(cookies); free(url);
+                free(action);
+                return;
+            }
+            free(verify);
             char *job = job_write(url, mode, ref, ua, name, dir, conn ? atoi(conn) : 0,
                                   qual ? atoi(qual) : 0, cookies);
             const char *via = job ? deliver_job(job) : NULL;
@@ -344,6 +423,13 @@ int host_install(int uninstall)
     char *self = exe_path();
     int rc = 0;
 
+    if (!uninstall && !self) {
+        /* the browser needs the full path; a bare "uloader.exe" would be
+           looked up in the browser's own folder */
+        ul_log(LOG_ERR, "cannot find the path of uloader.exe - browser integration not installed.");
+        rc = 1;
+        goto done;
+    }
     if (uninstall) {
         for (size_t i = 0; i < sizeof BROWSER_KEYS / sizeof *BROWSER_KEYS; i++)
             RegDeleteKeyW(HKEY_CURRENT_USER, BROWSER_KEYS[i]);
@@ -354,18 +440,18 @@ int host_install(int uninstall)
 
     sbuf js = { 0 };
     sb_puts(&js, "{\n  \"name\": \"" UL_HOST_NAME "\",\n  \"description\": \"U-loader download manager\",\n  \"path\": ");
-    json_put_string(&js, self ? self : "uloader.exe");
+    json_put_string(&js, self);
     sb_puts(&js, ",\n  \"type\": \"stdio\",\n  \"allowed_origins\": [\"chrome-extension://" UL_EXT_ID "/\"]\n}\n");
     FILE *f = fopen_u8(manifest, "wb");
-    if (!f || fwrite(js.s, 1, js.len, f) != js.len) {
-        if (f) fclose(f);
+    int wok = f && fwrite(js.s, 1, js.len, f) == js.len;
+    if (f && fclose(f) != 0) wok = 0;              /* a full disk shows up at fclose */
+    sb_free(&js);
+    if (!wok) {
         ul_log(LOG_ERR, "cannot write %s", manifest);
-        sb_free(&js);
+        file_delete(manifest);
         rc = 1;
         goto done;
     }
-    fclose(f);
-    sb_free(&js);
 
     wchar_t *wm = u8_to_w(manifest);
     int okc = 0;

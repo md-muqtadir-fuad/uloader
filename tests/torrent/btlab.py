@@ -7,7 +7,7 @@
   python -I btlab.py run [SCENARIO...]               the whole local test-suite (see SCENARIOS)
   python -I btlab.py verify TORRENT OUT_DIR          SHA-256/SHA-1 check of a finished download
 """
-import hashlib, json, os, random, socket, socketserver, struct, subprocess, sys, threading, time
+import hashlib, json, os, random, socket, socketserver, stat, struct, subprocess, sys, threading, time
 import http.server, urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -202,7 +202,9 @@ def recvn(s, n):
     return b
 
 class Seeder(threading.Thread):
-    """modes: good | corrupt | nometa | badmeta | partial"""
+    """modes: good | corrupt | nometa | badmeta | partial | leech | liesize | lateext
+       | shortblock (every block one byte short) | mdspam (unasked garbage metadata, garbage answers)
+       | mdslow (answers metadata requests after 0.5 s)"""
     def __init__(self, swarm, port, mode='good', rate=0, log=None):
         super().__init__(daemon=True)
         self.sw, self.port, self.mode, self.rate, self.log = swarm, port, mode, rate, log
@@ -316,6 +318,8 @@ class Seeder(threading.Thread):
                     if self.mode == 'corrupt' and self.rnd.random() < 0.3:
                         data[self.rnd.randrange(len(data))] ^= 0xFF
                         self.corrupted += 1
+                    if self.mode == 'shortblock':
+                        data = data[:-1]
                     c.sendall(struct.pack('>IBII', 9 + len(data), 7, idx, begin) + bytes(data))
                     self.sent += len(data)
                 elif mid == 20:
@@ -323,6 +327,13 @@ class Seeder(threading.Thread):
                     if eid == 0:
                         d, _ = bdec(msg[2:])
                         their_md = d.get(b'm', {}).get(b'ut_metadata', 0)
+                        if self.mode == 'mdspam' and their_md:      # metadata nobody asked for
+                            time.sleep(1.0)                          # (after the honest peers' pieces)
+                            n = len(sw.info_raw)
+                            for pi in range((n + 16383) // 16384):
+                                junk = os.urandom(min(16384, n - pi * 16384))
+                                hdr = benc({'msg_type': 1, 'piece': pi, 'total_size': n})
+                                c.sendall(struct.pack('>IBB', 2 + len(hdr) + len(junk), 20, their_md) + hdr + junk)
                     elif eid == 3 and self.mode not in ('nometa', 'liesize'):
                         d, _ = bdec(msg[2:])
                         if d.get(b'msg_type') == 0:
@@ -330,6 +341,10 @@ class Seeder(threading.Thread):
                             chunk = sw.info_raw[pi * 16384:(pi + 1) * 16384]
                             if self.mode == 'badmeta':
                                 chunk = bytes(len(chunk))
+                            elif self.mode == 'mdspam':
+                                chunk = os.urandom(len(chunk))
+                            elif self.mode == 'mdslow':
+                                time.sleep(0.5)
                             hdr = benc({'msg_type': 1, 'piece': pi, 'total_size': len(sw.info_raw)})
                             c.sendall(struct.pack('>IBB', 2 + len(hdr) + len(chunk), 20, their_md) + hdr + chunk)
                             self.md_served += 1
@@ -528,7 +543,11 @@ def state_progress(out_dir):
 
 def record(name, ok, detail):
     RESULTS.append((name, ok, detail))
-    print(('PASS ' if ok else 'FAIL ') + name + ': ' + detail, flush=True)
+    line = ('PASS ' if ok else 'FAIL ') + name + ': ' + detail
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:              # a console that cannot show the file names
+        print(line.encode('ascii', 'backslashreplace').decode(), flush=True)
 
 def check_files(name, torrent, out_dir, data_root):
     res = verify(torrent, out_dir, data_root)
@@ -573,6 +592,11 @@ def scenario_setup():
     ih['liesize'] = make_torrent(os.path.join(DATA, 'magnet', 'magnet-payload.bin'), os.path.join(TOR, 'liesize.torrent'), 65536,
                                  [ht], name='liesize-test.bin')
     ih['hostile'] = hostile(os.path.join(TOR, 'hostile.torrent'), os.path.join(DATA, 'hostile'), [ht])
+    # info dictionary of ~29 KB: two ut_metadata pieces
+    ih['mdmulti'] = make_torrent(os.path.join(DATA, 'single', 'big file.bin'), os.path.join(TOR, 'mdmulti.torrent'), 16384,
+                                 [ht], name='mdmulti.bin')
+    ih['shortblock'] = make_torrent(os.path.join(DATA, 'magnet', 'magnet-payload.bin'), os.path.join(TOR, 'shortblock.torrent'),
+                                    65536, [ht], name='shortblock-test.bin')
     sw = [
         {'torrent': os.path.join(TOR, 'single.torrent'), 'data': os.path.join(DATA, 'single', 'big file.bin'),
          'seeders': [{'port': 18500}, {'port': 18501}, {'port': 18502, 'mode': 'partial'}]},
@@ -592,6 +616,11 @@ def scenario_setup():
          'seeders': [{'port': 18550, 'mode': 'corrupt'}, {'port': 18551, 'rate': 1500000}]},
         {'torrent': os.path.join(TOR, 'hostile.torrent'), 'data': os.path.join(DATA, 'hostile', 'stream.bin'),
          'seeders': [{'port': 18560}]},
+        {'torrent': os.path.join(TOR, 'mdmulti.torrent'), 'data': os.path.join(DATA, 'single', 'big file.bin'),
+         'seeders': [{'port': 18590, 'mode': 'mdslow'}, {'port': 18591, 'mode': 'lateext'}, {'port': 18592, 'mode': 'badmeta'},
+                     {'port': 18593, 'mode': 'mdspam'}]},
+        {'torrent': os.path.join(TOR, 'shortblock.torrent'), 'data': os.path.join(DATA, 'magnet', 'magnet-payload.bin'),
+         'seeders': [{'port': 18600, 'mode': 'shortblock'}, {'port': 18601}]},
     ]
     cfg = {'http_port': HTTP_PORT, 'udp_port': UDP_PORT, 'torrent_dir': TOR, 'log': os.path.join(LAB, 'announces.json'),
            'stats': os.path.join(LAB, 'seeders.json'), 'swarms': sw}
@@ -787,7 +816,72 @@ def sc_nopeers(ih):
     record('no peers: clean failure', p.returncode == 1 and ('no peers found' in txt or 'could send this torrent' in txt),
            'rc=%s after %.0fs: %s' % (p.returncode, time.time() - t0, [l for l in txt.splitlines() if 'Error' in l]))
 
-SCENARIOS = ['single', 'multi', 'http_torrent', 'magnet', 'badmeta', 'liesize', 'pause', 'kill', 'magnet_pause', 'corrupt', 'garbage', 'hostile']
+def sc_magnet_ws(ih):
+    """a tracker with white space around it and a #fragment after the link (C2, low: fragment)"""
+    out = fresh(os.path.join(LAB, 'out-magnet-ws')); log = os.path.join(LAB, 'magnet-ws.log'); open(log, 'w').close()
+    mag = 'magnet:?dn=x&tr=%%20%s%%20&xt=urn:btih:%s#fragment' % (urllib.parse.quote('http://127.0.0.1:%d/announce' % HTTP_PORT, safe=''), ih['magnet'])
+    p = run_uloader([mag], out, log)
+    txt = logtext(log)
+    record('magnet: tracker with spaces, #fragment', p.returncode == 0 and 'metadata received' in txt, 'rc=%s' % p.returncode)
+    check_files('magnet content (spaces, #fragment)', os.path.join(TOR, 'magnet.torrent'), out, os.path.join(DATA, 'magnet', 'magnet-payload.bin'))
+
+def sc_md_liars(ih):
+    """two metadata pieces; two liars (one also sends metadata nobody asked for): no honest peer is banned (H15)"""
+    out = fresh(os.path.join(LAB, 'out-md-liars')); log = os.path.join(LAB, 'md-liars.log'); open(log, 'w').close()
+    mag = 'magnet:?xt=urn:btih:%s&tr=%s' % (ih['mdmulti'], urllib.parse.quote('http://127.0.0.1:%d/announce' % HTTP_PORT, safe=''))
+    t0 = time.time()
+    p = run_uloader([mag], out, log, timeout=240)
+    txt = logtext(log)
+    honest = [x for x in (18590, 18591) if 'banned peer 127.0.0.1:%d' % x in txt]
+    liars = [x for x in (18592, 18593) if 'banned peer 127.0.0.1:%d' % x in txt]
+    record('magnet: metadata liars do not get honest peers banned', p.returncode == 0 and 'metadata received' in txt and not honest,
+           'rc=%s in %.0fs, %d bad copies, honest banned %s, liars banned %s' % (p.returncode, time.time() - t0,
+           txt.count('does not match the info-hash'), honest, liars))
+    check_files('content after metadata liars', os.path.join(TOR, 'mdmulti.torrent'), out, os.path.join(DATA, 'single', 'big file.bin'))
+
+def sc_shortblock(ih):
+    """a seeder whose blocks are one byte short must not wedge the pieces it was asked for (H14)"""
+    out = fresh(os.path.join(LAB, 'out-shortblock')); log = os.path.join(LAB, 'shortblock.log'); open(log, 'w').close()
+    tor = os.path.join(TOR, 'shortblock.torrent')
+    t0 = time.time()
+    p = run_uloader([tor], out, log, timeout=90)
+    record('wrong-size blocks do not wedge the download', p.returncode == 0, 'rc=%s in %.1fs' % (p.returncode, time.time() - t0))
+    check_files('content despite wrong-size blocks', tor, out, os.path.join(DATA, 'magnet', 'magnet-payload.bin'))
+
+def sc_fixsizes(ih):
+    """a complete download rechecked: data past a file's end is cut, a missing empty file is created (medium 28)"""
+    out = fresh(os.path.join(LAB, 'out-fixsizes')); log = os.path.join(LAB, 'fixsizes.log'); open(log, 'w').close()
+    tor = os.path.join(TOR, 'multi.torrent')
+    p = run_uloader([tor], out, log)
+    base = os.path.join(out, 'Album \u0995\u09be\u099c')
+    with open(os.path.join(base, 'a.txt'), 'ab') as f:
+        f.write(b'junk' * 25)
+    os.remove(os.path.join(base, 'empty.dat'))
+    p2 = run_uloader([tor], out, log)
+    txt = logtext(log)
+    record('rerun of a complete torrent', p.returncode == 0 and p2.returncode == 0 and 'Already downloaded' in txt,
+           'rc=%s/%s' % (p.returncode, p2.returncode))
+    check_files('complete torrent: oversized file cut, missing empty file created', tor, out,
+                os.path.join(DATA, 'multi', 'Album \u0995\u09be\u099c'))
+
+def sc_readonly(ih):
+    """a complete, read-only file is checked, not downloaded again under another name (medium 26)"""
+    out = fresh(os.path.join(LAB, 'out-readonly')); log = os.path.join(LAB, 'readonly.log'); open(log, 'w').close()
+    tor = os.path.join(TOR, 'single.torrent')
+    p = run_uloader([tor], out, log)
+    path = os.path.join(out, 'big file.bin')
+    os.chmod(path, stat.S_IREAD)
+    try:
+        p2 = run_uloader([tor], out, log)
+        txt = logtext(log)
+        extra = [f for f in os.listdir(out) if f != 'big file.bin']
+        record('rerun on a read-only complete file', p.returncode == 0 and p2.returncode == 0 and 'Already downloaded' in txt and not extra,
+               'rc=%s/%s, other files %s' % (p.returncode, p2.returncode, extra))
+    finally:
+        os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+
+SCENARIOS = ['single', 'multi', 'http_torrent', 'magnet', 'badmeta', 'liesize', 'pause', 'kill', 'magnet_pause', 'corrupt', 'garbage', 'hostile',
+             'magnet_ws', 'md_liars', 'shortblock', 'fixsizes', 'readonly']
 
 def run(names):
     srv, ih = scenario_setup()

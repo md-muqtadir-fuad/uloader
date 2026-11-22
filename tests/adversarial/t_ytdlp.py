@@ -39,8 +39,8 @@ def t_vext_traversal():
     make_file_fast(os.path.join(srv, "a.bin"), 2000, 2)
     S = Server(srv)
     try:
-        txt = ("ULVID\tmp4\tx\\..\\..\\..\\ESCAPED_VIDEO.bin\tm4a\t{}\tTitle [abc]\n"
-               "%s\n%s\n" % (S.url("/f/v.bin"), S.url("/f/a.bin")))
+        txt = ulvid([S.url("/f/v.bin"), S.url("/f/a.bin")], vext="x\\..\\..\\..\\ESCAPED_VIDEO.bin",
+                    aext="m4a", title="Title", vid="abc")
         out = os.path.join(d, "out")
         rc, o, el, to = run(["--ytdlp", "-d", out, "https://example.com/watch"], os.path.join(d, "cwd"), 60,
                             env=env_with_fake(d, txt), exe=exe)
@@ -60,7 +60,8 @@ def t_title_newline():
     make_file_fast(os.path.join(srv, "other.bin"), 3000, 2)
     S = Server(srv)
     try:
-        txt = ("ULVID\tmp4\t\t\t{}\tCool clip\n%s [abc]\n%s\n" % (S.url("/f/other.bin"), S.url("/f/real.bin")))
+        # the title itself contains a line break and a link: it must stay part of the title
+        txt = ulvid([S.url("/f/real.bin")], title="Cool clip\n%s" % S.url("/f/other.bin"), vid="abc")
         out = os.path.join(d, "out")
         rc, o, el, to = run(["--ytdlp", "-d", out, "https://example.com/watch"], os.path.join(d, "cwd"), 60,
                             env=env_with_fake(d, txt), exe=exe)

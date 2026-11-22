@@ -386,6 +386,9 @@ static int host_admit(ftp_conn *c, double deadline)
     EnterCriticalSection(&g_hlock);
     for (;;) {
         double now = now_sec();
+        /* paused, or out of time: stop before opening yet another session */
+        if (http_aborted(c->s)) { rc = -1; break; }
+        if (now >= deadline) { rc = 0; break; }
         if (h->limit && now - h->limit_t > FTP_LIMIT_KEEP) h->limit = 0;
         if (!h->limit || (h->logged_in + h->connecting < h->limit && now - h->logout_t >= FTP_SLOT_GRACE)) {
             h->connecting++;
@@ -393,8 +396,6 @@ static int host_admit(ftp_conn *c, double deadline)
             rc = 1;
             break;
         }
-        if (http_aborted(c->s)) { rc = -1; break; }
-        if (now >= deadline) { rc = 0; break; }
         SleepConditionVariableCS(&g_hcv, &g_hlock, FTP_SLICE_MS);
     }
     LeaveCriticalSection(&g_hlock);
@@ -437,7 +438,11 @@ static int host_busy(ftp_conn *c)
     ftp_host *h = c->host;
     EnterCriticalSection(&g_hlock);
     int others = h->logged_in - (c->counted ? 1 : 0);
-    if (!h->limit) h->limit = others > 0 ? others : 1;
+    /* learn the cap - and lower it: a cap learned earlier may be too high
+       now (other clients took slots), and keeping it made every new
+       session hit "421" again at once */
+    int cap = others > 0 ? others : 1;
+    if (!h->limit || cap < h->limit) h->limit = cap;
     h->limit_t = now_sec();
     LeaveCriticalSection(&g_hlock);
     return others;
@@ -537,8 +542,12 @@ static int ftp_reply(ftp_conn *c)
             continue;
         }
         if (lc == code) {
+            int last = n == 3 || line[3] == ' ';
+            /* the closing line carries what callers parse (sizes, ports):
+               it must fit, even after a long multi-line text */
+            if (last && tl + strlen(n > 4 ? line + 4 : "") + 2 >= sizeof c->text) tl = 0;
             text_add(c, &tl, n > 4 ? line + 4 : "");
-            if (n == 3 || line[3] == ' ') break;
+            if (last) break;
         } else {
             text_add(c, &tl, line);
         }
@@ -825,16 +834,17 @@ static char *mdtm_to_http(const char *t)
 /* "229 Entering Extended Passive Mode (|||6446|)" */
 static int parse_epsv(const char *t)
 {
-    const char *p = strchr(t, '(');
-    if (!p) return -1;
-    char d = p[1];
-    if (d < 33 || d > 126 || isdigit((unsigned char)d) || p[2] != d || p[3] != d) return -1;
-    p += 4;
-    long v = 0;
-    int nd = 0;
-    while (isdigit((unsigned char)*p) && nd < 6) { v = v * 10 + (*p++ - '0'); nd++; }
-    if (!nd || *p != d || v < 1 || v > 65535) return -1;
-    return (int)v;
+    /* every "(" - the text before the "(|||port|)" may have its own */
+    for (const char *p = strchr(t, '('); p; p = strchr(p + 1, '(')) {
+        char d = p[1];
+        if (d < 33 || d > 126 || isdigit((unsigned char)d) || p[2] != d || p[3] != d) continue;
+        const char *q = p + 4;
+        long v = 0;
+        int nd = 0;
+        while (isdigit((unsigned char)*q) && nd < 6) { v = v * 10 + (*q++ - '0'); nd++; }
+        if (nd && *q == d && v >= 1 && v <= 65535) return (int)v;
+    }
+    return -1;
 }
 
 /* "227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)". Only the port is used:
@@ -1121,7 +1131,16 @@ int ftp_request(http_session *s, const char *url, int64_t from, int64_t to,
        end (up to FTP_BUSY_WAIT s) rather than retrying logins. */
     double deadline = now_sec() + (ts > FTP_BUSY_WAIT ? ts : FTP_BUSY_WAIT);
     int rc;
-    for (;;) {
+    for (int attempt = 0;; attempt++) {
+        if (attempt) {
+            /* a "421" again: never a tight reconnect loop against the server */
+            if (attempt > 20) {
+                snprintf(c->msg, sizeof c->msg, "no free connection to the FTP server (it limits connections)");
+                rc = 503;
+                break;
+            }
+            task_sleep(http_task(s), (DWORD)(attempt < 8 ? 250 * attempt : 2000));
+        }
         int w = host_admit(c, deadline);
         if (w < 0) { rc = ferr(c, ERR_CANCELLED, "cancelled"); break; }
         if (w == 0) {
@@ -1140,7 +1159,10 @@ int ftp_request(http_session *s, const char *url, int64_t from, int64_t to,
         conn_drop(c, NULL);
         if (others <= 0) break;             /* full of other clients: the caller backs off */
     }
-    if (rc == 0) rc = start_transfer(c, &q, from, to, r);
+    if (rc == 0) {
+        rc = start_transfer(c, &q, from, to, r);
+        if (rc == 503 && c->busy) host_busy(c);   /* "421" after login: learn the cap too */
+    }
 
     if (rc < 0) {
         int permanent = c->wsa == ERROR_NOT_SUPPORTED;     /* e.g. the server demands FTPS */
@@ -1156,7 +1178,12 @@ int ftp_request(http_session *s, const char *url, int64_t from, int64_t to,
         conn_drop(c, "QUIT\r\n");
         c->done = 1;
         r->status = rc;
-        if (c->msg[0]) snprintf(err, errlen, "%s", c->msg);
+        if (rc < 300) {             /* an empty file: complete, and dated like any other */
+            r->last_modified = q.mdtm;
+            q.mdtm = NULL;
+        } else if (c->msg[0]) {     /* the reason - never a stale one from a retry */
+            snprintf(err, errlen, "%s", c->msg);
+        }
     } else {
         r->last_modified = q.mdtm;
         q.mdtm = NULL;
@@ -1234,11 +1261,18 @@ int ftp_read(http_response *r, void *buf, DWORD len, DWORD *got)
         if (e != WSAEWOULDBLOCK) return read_fail(c, (DWORD)e);
 
         /* nothing buffered: wait, and also listen to the control connection
-           in case the server gives up on the transfer */
+           in case the server gives up on the transfer. A reply that came in
+           with an earlier one ("150 ...\r\n426 ...") is already in c->in -
+           the socket will not signal it again: act on it now. */
         SOCKET watch = (c->final || c->ctl_dead) ? INVALID_SOCKET : c->ctl;
-        int w = wait_sock(c, c->data, 0, watch, c->tmo_ms);
-        if (w < 0) return read_fail(c, (DWORD)c->wsa);
-        if (w == W_TIMEOUT) return read_fail(c, WSAETIMEDOUT);
+        int w;
+        if (watch != INVALID_SOCKET && c->inpos < c->inlen && memchr(c->in + c->inpos, '\n', (size_t)(c->inlen - c->inpos))) {
+            w = W_B;
+        } else {
+            w = wait_sock(c, c->data, 0, watch, c->tmo_ms);
+            if (w < 0) return read_fail(c, (DWORD)c->wsa);
+            if (w == W_TIMEOUT) return read_fail(c, WSAETIMEDOUT);
+        }
         if ((w & W_B) && !(w & W_A)) {
             int code = ftp_reply(c);
             if (code < 0) {

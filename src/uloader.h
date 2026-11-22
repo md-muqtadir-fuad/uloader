@@ -21,6 +21,11 @@
 #include <string.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <limits.h>
+
+/* 64-bit only: progress counters (volatile LONG64) are read by other
+   threads without locks, which is tear-free only on 64-bit Windows */
+_Static_assert(sizeof(void *) == 8, "U-loader is built for 64-bit Windows (x86_64 MinGW-w64)");
 
 #define UL_NAME        "U-loader"
 #define UL_VERSION     "1.1.0"
@@ -100,6 +105,7 @@ struct ul_task {
 
     /* control: the front-end sets this to pause/stop the task */
     volatile LONG abort;
+    int  ignore_ctrl_c;       /* 1 = g_abort does not stop it (a final tracker "stopped") */
 
     /* progress of the current file (written by the download thread) */
     volatile LONG64 done;     /* bytes                         */
@@ -194,8 +200,9 @@ void        json_put_string(sbuf *b, const char *s);
 
 /* cookies */
 int   cookies_load(ul_config *cfg, const char *path);       /* Netscape format */
-char *cookie_header_for(const ul_config *cfg, const char *url); /* NULL if none */
+char *cookie_header_for(const ul_config *cfg, const char *url, int include_raw); /* NULL if none */
 int   host_matches(const char *host, const char *domain);
+char *url_origin(const char *url);      /* "https://host:443" - credentials belong to one origin */
 
 /* URLs and file names */
 char *url_decode(const char *s, size_t n);
@@ -215,8 +222,9 @@ int     file_exists(const char *p);
 int     dir_exists(const char *p);
 int64_t file_size(const char *p);
 int     file_delete(const char *p);
-int     http_date_to_filetime(const char *http_date, FILETIME *ft);
-int     file_mtime_equals(const char *p, const FILETIME *ft);   /* 1 / 0 / -1 unknown */
+/* which server version a finished file is (hidden NTFS stream; dates untouched) */
+void    file_meta_write(const char *p, const char *etag, const char *lastmod);
+int     file_meta_matches(const char *p, const char *etag, const char *lastmod); /* 1 / 0 / -1 unknown */
 int     file_rename(const char *from, const char *to);
 int     dir_create(const char *p);
 int     dir_remove(const char *p);
@@ -229,6 +237,14 @@ char   *downloads_dir(void);
 char   *find_tool(const char *exe_name);
 
 /* processes */
+#define RUN_FAILED INT_MIN   /* run_process: could not start, or stopped because of a pause */
+
+/* total * i / n without the 64-bit overflow of the plain formula
+   (0 <= i <= n, n small: a segment or progress-map count) */
+static inline int64_t share_of(int64_t total, int i, int n)
+{
+    return total / n * i + total % n * i / n;
+}
 void cmd_append_arg(sbuf *b, const char *arg);
 int  run_process(const char *cmdline, char **captured_stdout, const ul_task *t);
 int  ffmpeg_merge(const char *ffmpeg, const char *video, const char *audio, const char *out, const ul_task *t);
@@ -343,6 +359,9 @@ int is_magnet(const char *s);
 /* source: magnet URI or path of a .torrent file; or data/len = contents
    of a .torrent fetched over HTTP (source is then its URL). Saves into
    cfg->out_dir. Progress/abort through http_task(s). 0 ok, 1 error, 2 paused. */
+/* Give the "stopped" / "completed" messages to the trackers (sent in the
+   background) up to `ms` to go out before the program exits. */
+void torrent_flush_announces(int ms);
 int torrent_run(http_session *s, ul_config *cfg, const char *source,
                 const unsigned char *data, size_t len);
 

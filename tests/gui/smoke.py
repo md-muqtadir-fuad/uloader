@@ -201,22 +201,28 @@ def main():
         ok("404 shows as error", states.get("missing-file.zip") == "error")
 
         # ---------------- 6. clipboard watch -> Add dialog ---------------------------------
-        link = base + "/files/new-release-2.1.zip"
-        U.set_clipboard(link)
-        dlg = U.find_dialog(p.pid, "Add download", 5)
-        ok("clipboard watch opens the Add dialog", dlg and link in U.dlg_text(dlg, 1001))
-        time.sleep(0.5)
-        U.capture(dlg, os.path.join(SHOTS, "add_dialog.png"))
-        U.user32.PostMessageW(dlg, U.WM_COMMAND, U.IDCANCEL, 0)
-        U.wait_for(lambda: not U.dialogs(p.pid), 5, what="dialog closed")
-        U.set_clipboard("just some text")
-        time.sleep(0.5)
-        U.set_clipboard(link)
-        time.sleep(1.5)
-        ok("same link is not offered twice", not U.dialogs(p.pid))
-        U.set_clipboard(base + "/page/readme.html")
-        time.sleep(1.0)
-        ok("non-download link is ignored", not U.dialogs(p.pid))
+        # The clipboard is shared: a real U-loader window that watches it would
+        # pop up its own Add dialog for these test links. Only with no such window.
+        real_window = U.CLASS != "ULoaderMainWindow" and U.user32.FindWindowW("ULoaderMainWindow", None)
+        if real_window:
+            print("  SKIP  clipboard watch: a real U-loader window is open and would see the test links")
+        else:
+            link = base + "/files/new-release-2.1.zip"
+            U.set_clipboard(link)
+            dlg = U.find_dialog(p.pid, "Add download", 5)
+            ok("clipboard watch opens the Add dialog", dlg and link in U.dlg_text(dlg, 1001))
+            time.sleep(0.5)
+            U.capture(dlg, os.path.join(SHOTS, "add_dialog.png"))
+            U.user32.PostMessageW(dlg, U.WM_COMMAND, U.IDCANCEL, 0)
+            U.wait_for(lambda: not U.dialogs(p.pid), 5, what="dialog closed")
+            U.set_clipboard("just some text")
+            time.sleep(0.5)
+            U.set_clipboard(link)
+            time.sleep(1.5)
+            ok("same link is not offered twice", not U.dialogs(p.pid))
+            U.set_clipboard(base + "/page/readme.html")
+            time.sleep(1.0)
+            ok("non-download link is ignored", not U.dialogs(p.pid))
 
         # ---------------- 7. settings dialog -----------------------------------------------
         U.command(main, "SETTINGS")

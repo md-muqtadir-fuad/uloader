@@ -10,6 +10,7 @@
 #include "uloader.h"
 #include <process.h>
 #include <bcrypt.h>
+#include <errno.h>
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
@@ -131,6 +132,7 @@ static int parse_master(const char *text, const char *base, hls_variant **out,
         if (str_istarts(line, "#EXT-X-STREAM-INF:")) {
             const char *at = line + 18;
             char *bw = hls_attr(at, "BANDWIDTH"), *res = hls_attr(at, "RESOLUTION");
+            if (pending) free(pv.audio_group);      /* a STREAM-INF without its URI line */
             memset(&pv, 0, sizeof pv);
             pv.bw = bw ? _strtoi64(bw, NULL, 10) : 0;
             if (res) sscanf(res, "%dx%d", &pv.width, &pv.height);
@@ -142,10 +144,12 @@ static int parse_master(const char *text, const char *base, hls_variant **out,
             const char *at = line + 13;
             char *type = hls_attr(at, "TYPE"), *uri = hls_attr(at, "URI");
             char *grp = hls_attr(at, "GROUP-ID"), *def = hls_attr(at, "DEFAULT");
-            if (type && uri && grp && _stricmp(type, "AUDIO") == 0) {
+            if (type && grp && _stricmp(type, "AUDIO") == 0) {
                 aurl = xrealloc(aurl, sizeof(char *) * (size_t)(na + 1));
                 agrp = xrealloc(agrp, sizeof(char *) * (size_t)(na + 1));
-                aurl[na] = url_resolve(base, uri);
+                /* no URI = this audio is muxed into the video stream (kept so
+                   that a DEFAULT one is not replaced by a commentary track) */
+                aurl[na] = uri ? url_resolve(base, uri) : NULL;
                 agrp[na] = xasprintf("%s%s", (def && _stricmp(def, "YES") == 0) ? "*" : "", grp);
                 na++;
             }
@@ -157,6 +161,7 @@ static int parse_master(const char *text, const char *base, hls_variant **out,
             pending = 0;
         }
     }
+    if (pending) free(pv.audio_group);
     free(buf);
     *out = v;
     *audio_urls = aurl;
@@ -210,6 +215,8 @@ static int parse_media(const char *text, const char *base, hls_media *m)
                 free(m->map_url);
                 m->map_url = url_resolve(base, uri);
                 m->map_key = cur_key;
+                m->map_len = -1;                    /* a new map is whole unless it says otherwise */
+                m->map_off = 0;
                 if (br) {
                     long long l = 0, o = 0;
                     int k = sscanf(br, "%lld@%lld", &l, &o);
@@ -276,6 +283,7 @@ typedef struct {
     const ul_headers  *hd;
     hls_media         *m;
     char              *dir;
+    HANDLE             dirlock;     /* "<dir>\.lock": this download owns the cache */
     BCRYPT_ALG_HANDLE  aes;
     CRITICAL_SECTION   lock;
     volatile LONG      next;
@@ -325,14 +333,14 @@ static int aes_decrypt(hls_ctx *c, char *data, size_t *len, const uint8_t key[16
     NTSTATUS st = BCryptDecrypt(hk, (PUCHAR)data, (ULONG)*len, NULL, iv, 16,
                                 (PUCHAR)data, (ULONG)*len, &outlen, 0);
     BCryptDestroyKey(hk);
-    if (!NT_SUCCESS(st)) return 0;
+    if (!NT_SUCCESS(st) || outlen != (ULONG)*len) return 0;
+    /* AES-128 segments always end in PKCS#7 padding. Bad padding means a
+       wrong key or damaged data: fail, never save garbage as "done". */
     unsigned pad = (unsigned char)data[*len - 1];
-    if (pad >= 1 && pad <= 16) {
-        int okpad = 1;
-        for (unsigned i = 0; i < pad; i++)
-            if ((unsigned char)data[*len - 1 - i] != pad) { okpad = 0; break; }
-        if (okpad) *len -= pad;
-    }
+    if (pad < 1 || pad > 16) return 0;
+    for (unsigned i = 0; i < pad; i++)
+        if ((unsigned char)data[*len - 1 - i] != pad) return 0;
+    *len -= pad;
     return 1;
 }
 
@@ -361,7 +369,7 @@ static int fetch_segment(hls_ctx *c, int i, char *err, size_t errlen)
             for (int b = 0; b < 8; b++) iv[15 - b] = (uint8_t)(sq >> (8 * b));
         }
         if (!aes_decrypt(c, data, &n, k, iv)) {
-            snprintf(err, errlen, "AES-128 decryption failed");
+            snprintf(err, errlen, "AES-128 decryption failed (wrong key or damaged data)");
             free(data);
             return 0;
         }
@@ -396,8 +404,10 @@ static unsigned __stdcall hls_worker(void *arg)
             /* speed limit: shared by all segment workers */
             int64_t lim = c->cfg->speed_limit;
             if (lim > 0) {
-                double due = c->t0 + (double)c->bytes / (double)lim, now = now_sec();
-                if (due > now) task_sleep(t, (DWORD)((due - now) * 1000.0));
+                /* wait in small steps (no DWORD overflow on a big lag) and
+                   stop waiting when another worker failed or on pause */
+                double due = c->t0 + (double)c->bytes / (double)lim;
+                while (!task_aborted(t) && !c->failed && now_sec() < due) Sleep(100);
             }
         } else if (!task_aborted(t)) {
             EnterCriticalSection(&c->lock);
@@ -409,8 +419,44 @@ static unsigned __stdcall hls_worker(void *arg)
     return 0;
 }
 
+/* Two downloads that end up with the same name (a CDN that calls every
+   video "1080p.av1.mp4.m3u8", or one video started twice) must never share
+   a segment folder: the second used to take the first one's segments for
+   "a different stream" and delete them, and the first then failed at the
+   join. The owner keeps "<dir>\.lock" open without sharing (deleted when
+   closed); others see ERROR_SHARING_VIOLATION. */
+static HANDLE cache_lock(const char *dir)
+{
+    char *p = xasprintf("%s\\.lock", dir);
+    wchar_t *w = wpath(p);
+    HANDLE h = CreateFileW(w, GENERIC_WRITE, 0, NULL, OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+    free(w);
+    free(p);
+    return h;
+}
+
+/* is a download running in the cache folder of this base name right now? */
+static int hls_cache_busy(const char *base)
+{
+    static const char *sfx[] = { ".ulhls", ".video.ulhls", ".audio.ulhls" };
+    for (size_t i = 0; i < sizeof sfx / sizeof *sfx; i++) {
+        char *d = xasprintf("%s%s", base, sfx[i]);
+        int busy = 0;
+        if (dir_exists(d)) {
+            HANDLE h = cache_lock(d);
+            if (h == INVALID_HANDLE_VALUE) busy = GetLastError() == ERROR_SHARING_VIOLATION;
+            else CloseHandle(h);
+        }
+        free(d);
+        if (busy) return 1;
+    }
+    return 0;
+}
+
 static void hls_ctx_free(hls_ctx *c)
 {
+    if (c->dirlock && c->dirlock != INVALID_HANDLE_VALUE) CloseHandle(c->dirlock);
     if (c->aes) BCryptCloseAlgorithmProvider(c->aes, 0);
     DeleteCriticalSection(&c->lock);
     media_free(c->m);
@@ -420,11 +466,28 @@ static void hls_ctx_free(hls_ctx *c)
     free(c);
 }
 
-/* Download one media playlist into "<base>.ts" (or .mp4/.aac).
+/* Identity of a downloaded stream. It is kept with the finished file
+   (NTFS stream, file_meta_write) so a later run knows that file is this
+   stream, complete - e.g. the video part when only the audio was paused. */
+static char *stream_id(const char *url, int nsegs)
+{
+    size_t q = strcspn(url, "?#");
+    return xasprintf("hls:%.*s#%d", (int)q, url, nsegs);
+}
+
+static int is_stream_file(const char *path, const char *id)
+{
+    return file_exists(path) && file_meta_matches(path, id, NULL) == 1;
+}
+
+/* Download one media playlist. The segments are joined into "<base>.ts"
+   (or .mp4 / .aac, by content). The result is then saved as `want` when
+   given (a caller that needs exactly that name), else as "<base>.mp4"
+   when `ff` is given and the content is MPEG-TS (remuxed by ffmpeg).
    Returns 0 ok, 1 error, 2 paused; *out_path receives the file name. */
 static int hls_fetch_media(http_session *s, const ul_config *cfg, const ul_headers *hd,
                            const char *url, const char *text_in, const char *base,
-                           const char *label, char **out_path)
+                           const char *label, const char *want, const char *ff, char **out_path)
 {
     ul_task *t = http_task(s);
     char err[256], a[32];
@@ -459,8 +522,11 @@ static int hls_fetch_media(http_session *s, const ul_config *cfg, const ul_heade
     free(text);
     free(final);
     if (n == 0) { tlog(t, LOG_ERR, "the playlist has no segments"); media_free(m); free(m); return 1; }
-    for (int i = 0; i < m->nkeys; i++) {
-        if (m->keys[i].method == KEY_UNSUPPORTED) {
+    /* only a key that is really used matters (an unused SAMPLE-AES entry
+       next to a clear stream must not block it) */
+    for (int i = 0; i <= m->nsegs; i++) {
+        int k = i < m->nsegs ? m->segs[i].key : (m->map_url ? m->map_key : -1);
+        if (k >= 0 && m->keys[k].method == KEY_UNSUPPORTED) {
             tlog(t, LOG_ERR, "this stream is DRM-protected (SAMPLE-AES / FairPlay / Widevine) and cannot be downloaded");
             media_free(m);
             free(m);
@@ -478,222 +544,320 @@ static int hls_fetch_media(http_session *s, const ul_config *cfg, const ul_heade
     free(first);
 
     char *out = xasprintf("%s%s", base, ext);
+    char *dest = want ? xstrdup(want) : (ff && !strcmp(ext, ".ts")) ? xasprintf("%s.mp4", base) : xstrdup(out);
+    char *id = stream_id(url, m->nsegs);
     hls_ctx *c = xcalloc(1, sizeof *c);
     c->s = s; c->cfg = cfg; c->hd = hd; c->m = m;
     c->dir = xasprintf("%s.ulhls", base);
     c->segdone = xcalloc((size_t)m->nsegs, 1);
     InitializeCriticalSection(&c->lock);
-    task_set_file(t, path_basename(out), out);
+    task_set_file(t, path_basename(dest), dest);
+    int rc = 1;
+    double t0 = now_sec();
 
-    if (dir_create(c->dir) != 0) {
-        tlog(t, LOG_ERR, "cannot create folder %s", c->dir);
-        free(out);
-        hls_ctx_free(c);
-        return 1;
-    }
-    if (m->nkeys > 0) {
-        if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&c->aes, BCRYPT_AES_ALGORITHM, NULL, 0)) ||
-            !NT_SUCCESS(BCryptSetProperty(c->aes, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_CBC,
-                                          sizeof(BCRYPT_CHAIN_MODE_CBC), 0))) {
-            tlog(t, LOG_ERR, "AES is not available on this system");
-            free(out);
-            hls_ctx_free(c);
-            return 1;
+    /* finished by an earlier run? (then only what is left is done) */
+    int joined = 0;
+    if (!dir_exists(c->dir)) {
+        if (is_stream_file(dest, id)) {
+            tlog(t, LOG_DIM, "  %salready downloaded", label ? label : "");
+            t->done = t->total = file_size(dest);
+            *out_path = dest;
+            dest = NULL;
+            rc = 0;
+            goto done;
         }
+        joined = _stricmp(dest, out) != 0 && is_stream_file(out, id);   /* paused while converting */
     }
 
-    /* The cache must belong to this exact stream (same playlist, same
-       number of segments); otherwise segments of different qualities
-       would be joined together. */
-    {
-        size_t q = strcspn(url, "?#");
-        char *id = xasprintf("%.*s\n%d\n", (int)q, url, m->nsegs);
-        char *mf = xasprintf("%s\\stream.txt", c->dir);
-        size_t ol = 0;
-        char *old = read_file(mf, &ol);
-        if (old && strcmp(old, id) != 0) {
-            tlog(t, LOG_WARN, "the saved segments belong to a different stream - starting this one fresh");
-            const char *nl = strchr(old, '\n');
-            long old_n = nl ? strtol(nl + 1, NULL, 10) : 0;
-            if (old_n < 0 || old_n > 10000000) old_n = 0;
-            long n_del = old_n > m->nsegs ? old_n : m->nsegs;
-            for (long i = -1; i < n_del; i++) {
-                char *p = seg_path(c->dir, (int)i);
-                file_delete(p);
-                free(p);
+    if (!joined) {
+        if (dir_create(c->dir) != 0) {
+            tlog(t, LOG_ERR, "cannot create folder %s", c->dir);
+            goto done;
+        }
+        c->dirlock = cache_lock(c->dir);
+        if (c->dirlock == INVALID_HANDLE_VALUE) {
+            DWORD e = GetLastError();
+            if (e == ERROR_SHARING_VIOLATION)
+                tlog(t, LOG_ERR, "another download is already saving this stream into %s - "
+                                 "wait for it to finish (or give this one another name)", c->dir);
+            else
+                tlog(t, LOG_ERR, "cannot use the folder %s: %s", c->dir, win_errstr(e, err, sizeof err));
+            goto done;
+        }
+        if (m->nkeys > 0) {
+            if (!NT_SUCCESS(BCryptOpenAlgorithmProvider(&c->aes, BCRYPT_AES_ALGORITHM, NULL, 0)) ||
+                !NT_SUCCESS(BCryptSetProperty(c->aes, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_CBC,
+                                              sizeof(BCRYPT_CHAIN_MODE_CBC), 0))) {
+                tlog(t, LOG_ERR, "AES is not available on this system");
+                goto done;
             }
         }
-        if (!old || strcmp(old, id) != 0) {
-            FILE *f = fopen_u8(mf, "wb");
-            if (f) { fputs(id, f); fclose(f); }
-        }
-        free(old);
-        free(mf);
-        free(id);
-    }
 
-    int resumed = 0;
-    int64_t resumed_bytes = 0;
-    for (int i = 0; i < m->nsegs; i++) {
-        char *p = seg_path(c->dir, i);
-        int64_t sz = file_size(p);
-        if (sz >= 0) { c->segdone[i] = 1; c->done++; resumed_bytes += sz; resumed++; }
-        free(p);
-    }
-
-    long mins = (long)(m->duration / 60), secs = (long)m->duration % 60;
-    int conns = cfg->connections < m->nsegs ? cfg->connections : m->nsegs;
-    if (conns > UL_MAX_CONN) conns = UL_MAX_CONN;
-    if (conns < 1) conns = 1;
-    tlog(t, LOG_DIM, "  %s%d segments  |  %ld:%02ld  |  %d connections%s", label ? label : "",
-         m->nsegs, mins, secs, conns, m->nkeys ? "  |  AES-128" : "");
-    if (resumed) tlog(t, LOG_DIM, "  resuming: %d segments already downloaded", resumed);
-
-    if (m->map_url) {
-        char *mp = seg_path(c->dir, -1);
-        int have = file_exists(mp);
-        free(mp);
-        if (!have && !fetch_segment(c, -1, err, sizeof err)) {
-            tlog(t, LOG_ERR, "init segment: %s", err);
-            int rc0 = task_aborted(t) ? 2 : 1;
-            free(out);
-            hls_ctx_free(c);
-            return rc0;
+        /* The cache must belong to this exact stream (same playlist, same
+           number of segments); otherwise segments of different qualities
+           would be joined together. Segments without that record are of
+           unknown origin and are not used either. */
+        {
+            size_t uq = strcspn(url, "?#");
+            char *sid = xasprintf("%.*s\n%d\n", (int)uq, url, m->nsegs);
+            char *mf = xasprintf("%s\\stream.txt", c->dir);
+            size_t ol = 0;
+            char *old = read_file(mf, &ol);
+            if (!old || strcmp(old, sid) != 0) {
+                if (old) tlog(t, LOG_WARN, "the saved segments belong to a different stream - starting this one fresh");
+                const char *nl = old ? strchr(old, '\n') : NULL;
+                long old_n = nl ? strtol(nl + 1, NULL, 10) : 0;
+                if (old_n < 0 || old_n > 10000000) old_n = 0;
+                long n_del = old_n > m->nsegs ? old_n : m->nsegs;
+                for (long i = -1; i < n_del; i++) {
+                    char *p = seg_path(c->dir, (int)i);
+                    file_delete(p);
+                    free(p);
+                }
+                FILE *f = fopen_u8(mf, "wb");
+                if (f) { fputs(sid, f); fclose(f); }
+            }
+            free(old);
+            free(mf);
+            free(sid);
         }
-    }
 
-    HANDLE th[UL_MAX_CONN];
-    int nth = 0;
-    double t0 = now_sec();
-    c->t0 = t0;
-    for (int i = 0; i < conns; i++) {
-        th[nth] = (HANDLE)_beginthreadex(NULL, 0, hls_worker, c, 0, NULL);
-        if (th[nth]) nth++;
-    }
-    double last_t = t0, speed = 0;
-    int64_t last_b = 0;
-    int all_done = nth == 0;
-    while (!all_done) {
-        DWORD wr = WaitForMultipleObjects((DWORD)nth, th, TRUE, 500);
-        all_done = wr != WAIT_TIMEOUT;
-        double tm = now_sec();
-        int64_t bytes = c->bytes;
-        if (tm - last_t >= 1.0) {
-            double inst = (double)(bytes - last_b) / (tm - last_t);
-            speed = speed > 0 ? speed * 0.6 + inst * 0.4 : inst;
-            last_t = tm;
-            last_b = bytes;
+        int resumed = 0;
+        int64_t resumed_bytes = 0;
+        for (int i = 0; i < m->nsegs; i++) {
+            char *p = seg_path(c->dir, i);
+            int64_t sz = file_size(p);
+            if (sz >= 0) { c->segdone[i] = 1; c->done++; resumed_bytes += sz; resumed++; }
+            free(p);
         }
-        int done = c->done;
-        int64_t got = resumed_bytes + bytes;
-        int64_t est = done > 0 ? (int64_t)((double)got / done * m->nsegs) : -1;
-        unsigned char map[UL_SEGVIEW];
-        for (int k = 0; k < UL_SEGVIEW; k++) {
-            int a0 = (int)((int64_t)m->nsegs * k / UL_SEGVIEW);
-            int b0 = (int)((int64_t)m->nsegs * (k + 1) / UL_SEGVIEW);
-            if (b0 <= a0) b0 = a0 + 1;
-            if (b0 > m->nsegs) b0 = m->nsegs;
-            int cnt = 0;
-            for (int i = a0; i < b0; i++) cnt += c->segdone[i] ? 1 : 0;
-            map[k] = b0 > a0 ? (unsigned char)(cnt * 255 / (b0 - a0)) : 0;
-        }
-        EnterCriticalSection(&t->lock);
-        memcpy(t->segmap, map, sizeof map);
-        snprintf(t->stage, sizeof t->stage, "seg %d/%d", done, m->nsegs);
-        LeaveCriticalSection(&t->lock);
-        t->done = got;
-        t->total = est;
-        t->speed = (LONG64)speed;
-        t->eta = (speed > 1 && est > got) ? (LONG64)((double)(est - got) / speed) : -1;
-        t->conns = nth;
-        task_progress(t);
-        if ((task_aborted(t) || c->failed) && !all_done) {
-            /* close connections the workers may be blocked on, then wait
-               until every one has exited: they use c, the session and cfg */
-            while (WaitForMultipleObjects((DWORD)nth, th, TRUE, 200) == WAIT_TIMEOUT)
-                http_session_cancel(s);
-            all_done = 1;
-        }
-    }
-    con_progress_end();
-    task_set_stage(t, "%s", "");
-    for (int i = 0; i < nth; i++) CloseHandle(th[i]);
-    double elapsed = now_sec() - t0;
 
-    int rc = 1;
-    if (task_aborted(t)) {
-        tlog(t, LOG_WARN, "paused - start it again to resume.");
-        rc = 2;
-    } else if (c->failed || c->done < m->nsegs) {
-        tlog(t, LOG_ERR, "%s", c->err[0] ? c->err : "some segments could not be downloaded");
-        tlog(t, LOG_INFO, "  Downloaded segments are kept - start it again to resume.");
-    } else {
-        /* join: init + segments -> output */
+        long mins = (long)(m->duration / 60), secs = (long)m->duration % 60;
+        int conns = cfg->connections < m->nsegs ? cfg->connections : m->nsegs;
+        if (conns > UL_MAX_CONN) conns = UL_MAX_CONN;
+        if (conns < 1) conns = 1;
+        tlog(t, LOG_DIM, "  %s%d segments  |  %ld:%02ld  |  %d connections%s", label ? label : "",
+             m->nsegs, mins, secs, conns, m->nkeys ? "  |  AES-128" : "");
+        if (resumed) tlog(t, LOG_DIM, "  resuming: %d segments already downloaded", resumed);
+
+        if (m->map_url) {
+            char *mp = seg_path(c->dir, -1);
+            int have = file_exists(mp);
+            free(mp);
+            if (!have && !fetch_segment(c, -1, err, sizeof err)) {
+                tlog(t, LOG_ERR, "init segment: %s", err);
+                rc = task_aborted(t) ? 2 : 1;
+                goto done;
+            }
+        }
+
+        HANDLE th[UL_MAX_CONN];
+        int nth = 0;
+        c->t0 = t0;
+        for (int i = 0; i < conns; i++) {
+            th[nth] = (HANDLE)_beginthreadex(NULL, 0, hls_worker, c, 0, NULL);
+            if (th[nth]) nth++;
+        }
+        double last_t = t0, speed = 0;
+        int64_t last_b = 0;
+        int all_done = nth == 0;
+        while (!all_done) {
+            DWORD wr = WaitForMultipleObjects((DWORD)nth, th, TRUE, 500);
+            all_done = wr != WAIT_TIMEOUT;
+            double tm = now_sec();
+            int64_t bytes = c->bytes;
+            if (tm - last_t >= 1.0) {
+                double inst = (double)(bytes - last_b) / (tm - last_t);
+                speed = speed > 0 ? speed * 0.6 + inst * 0.4 : inst;
+                last_t = tm;
+                last_b = bytes;
+            }
+            int done = c->done;
+            int64_t got = resumed_bytes + bytes;
+            int64_t est = done > 0 ? (int64_t)((double)got / done * m->nsegs) : -1;
+            unsigned char map[UL_SEGVIEW];
+            for (int k = 0; k < UL_SEGVIEW; k++) {
+                int a0 = (int)((int64_t)m->nsegs * k / UL_SEGVIEW);
+                int b0 = (int)((int64_t)m->nsegs * (k + 1) / UL_SEGVIEW);
+                if (b0 <= a0) b0 = a0 + 1;
+                if (b0 > m->nsegs) b0 = m->nsegs;
+                int cnt = 0;
+                for (int i = a0; i < b0; i++) cnt += c->segdone[i] ? 1 : 0;
+                map[k] = b0 > a0 ? (unsigned char)(cnt * 255 / (b0 - a0)) : 0;
+            }
+            EnterCriticalSection(&t->lock);
+            memcpy(t->segmap, map, sizeof map);
+            snprintf(t->stage, sizeof t->stage, "seg %d/%d", done, m->nsegs);
+            LeaveCriticalSection(&t->lock);
+            t->done = got;
+            t->total = est;
+            t->speed = (LONG64)speed;
+            t->eta = (speed > 1 && est > got) ? (LONG64)((double)(est - got) / speed) : -1;
+            t->conns = nth;
+            task_progress(t);
+            if ((task_aborted(t) || c->failed) && !all_done) {
+                /* close connections the workers may be blocked on, then wait
+                   until every one has exited: they use c, the session and cfg */
+                while (WaitForMultipleObjects((DWORD)nth, th, TRUE, 200) == WAIT_TIMEOUT)
+                    http_session_cancel(s);
+                all_done = 1;
+            }
+        }
+        con_progress_end();
+        task_set_stage(t, "%s", "");
+        for (int i = 0; i < nth; i++) CloseHandle(th[i]);
+
+        if (task_aborted(t)) {
+            tlog(t, LOG_WARN, "paused - start it again to resume.");
+            rc = 2;
+            goto done;
+        }
+        if (c->failed || c->done < m->nsegs) {
+            tlog(t, LOG_ERR, "%s", c->err[0] ? c->err : "some segments could not be downloaded");
+            tlog(t, LOG_INFO, "  Downloaded segments are kept - start it again to resume.");
+            goto done;
+        }
+
+        /* join: init + segments -> out */
         task_set_stage(t, "%s", "joining");
         task_progress(t);
+        /* Every failure says what it was: "disk full?" for everything sent
+           people looking at free space when a segment had gone missing. */
         char *tmp = xasprintf("%s.ulpart", out);
+        char why[400] = "";
         FILE *fo = fopen_u8(tmp, "wb");
-        int ok = fo != NULL;
+        if (!fo) snprintf(why, sizeof why, "cannot create %s: %s", tmp, strerror(errno));
         char *cbuf = xmalloc(1 << 20);
-        for (int i = m->map_url ? -1 : 0; ok && i < m->nsegs; i++) {
+        for (int i = m->map_url ? -1 : 0; !why[0] && i < m->nsegs; i++) {
             char *p = seg_path(c->dir, i);
             FILE *fi = fopen_u8(p, "rb");
-            if (!fi) { ok = 0; free(p); break; }
+            if (!fi) {
+                /* gone from the cache: the next start fetches it again */
+                if (i < 0) snprintf(why, sizeof why, "the init segment is missing from %s", c->dir);
+                else snprintf(why, sizeof why, "segment %d of %d is missing from %s", i + 1, m->nsegs, c->dir);
+                c->failed = 1;
+                free(p);
+                break;
+            }
             size_t r;
-            while ((r = fread(cbuf, 1, 1 << 20, fi)) > 0)
-                if (fwrite(cbuf, 1, r, fo) != r) { ok = 0; break; }
-            if (ferror(fi)) ok = 0;
+            while (!why[0] && (r = fread(cbuf, 1, 1 << 20, fi)) > 0)
+                if (fwrite(cbuf, 1, r, fo) != r)
+                    snprintf(why, sizeof why, errno == ENOSPC ? "the disk is full (writing %s)" : "cannot write %s: %s",
+                             tmp, strerror(errno));
+            if (!why[0] && ferror(fi)) snprintf(why, sizeof why, "cannot read %s", p);
             fclose(fi);
             free(p);
         }
         free(cbuf);
-        if (fo && fclose(fo) != 0) ok = 0;
-        if (ok && file_rename(tmp, out) == 0) {
-            for (int i = m->map_url ? -1 : 0; i < m->nsegs; i++) {
-                char *p = seg_path(c->dir, i);
-                file_delete(p);
-                free(p);
-            }
-            dir_remove(c->dir);
-            int64_t sz = file_size(out);
-            t->done = t->total = sz;
-            tlog(t, LOG_OK, "  Done: %s in %.1fs", fmt_size(sz, a, sizeof a), elapsed);
-            *out_path = out;
-            out = NULL;
-            rc = 0;
-        } else {
-            tlog(t, LOG_ERR, "could not write %s (disk full?)", out);
-            file_delete(tmp);
-        }
+        if (fo && fclose(fo) != 0 && !why[0])
+            snprintf(why, sizeof why, errno == ENOSPC ? "the disk is full (writing %s)" : "cannot write %s: %s",
+                     tmp, strerror(errno));
         task_set_stage(t, "%s", "");
+        if (!why[0] && file_rename(tmp, out) != 0) {
+            char e[200];
+            snprintf(why, sizeof why, "cannot save %s: %s (is it open in another program?)", out,
+                     win_errstr(GetLastError(), e, sizeof e));
+        }
+        if (why[0]) {
+            tlog(t, LOG_ERR, "%s", why);
+            if (c->failed) tlog(t, LOG_INFO, "  Start it again: the missing part is downloaded again.");
+            file_delete(tmp);
+            free(tmp);
+            goto done;
+        }
         free(tmp);
+        file_meta_write(out, id, NULL);
+        /* the cache is finished with: every file in it, then the folder
+           (a leftover stream.txt kept the folder - and the next download
+           of the same name took it for a paused one and overwrote) */
+        for (int i = m->map_url ? -1 : 0; i < m->nsegs; i++) {
+            char *p = seg_path(c->dir, i);
+            file_delete(p);
+            free(p);
+        }
+        char *mf = xasprintf("%s\\stream.txt", c->dir);
+        file_delete(mf);
+        free(mf);
+        CloseHandle(c->dirlock);                       /* deletes .lock: the folder is empty now */
+        c->dirlock = NULL;
+        dir_remove(c->dir);
     }
+
+    /* the joined file -> the name the caller wants */
+    if (_stricmp(dest, out) != 0) {
+        if (ff && str_iends(out, ".ts") && str_iends(dest, ".mp4")) {
+            tlog(t, LOG_DIM, "  converting to .mp4 with ffmpeg...");
+            task_set_stage(t, "%s", "converting");
+            task_progress(t);
+            int fr = ffmpeg_remux(ff, out, dest, t);
+            task_set_stage(t, "%s", "");
+            if (fr == 0) {
+                file_delete(out);
+                file_meta_write(dest, id, NULL);
+            } else if (task_aborted(t)) {
+                tlog(t, LOG_WARN, "paused - start it again to finish the conversion.");
+                rc = 2;
+                goto done;
+            } else {
+                tlog(t, LOG_WARN, "ffmpeg conversion failed; kept %s", out);
+                free(dest);
+                dest = xstrdup(out);
+            }
+        } else if (file_rename(out, dest) != 0) {
+            tlog(t, LOG_ERR, "could not rename %s to %s: %s", out, dest, win_errstr(GetLastError(), err, sizeof err));
+            goto done;
+        }
+    }
+    int64_t sz = file_size(dest);
+    t->done = t->total = sz;
+    task_set_file(t, path_basename(dest), dest);
+    tlog(t, LOG_OK, "  Done: %s in %.1fs", fmt_size(sz, a, sizeof a), now_sec() - t0);
+    *out_path = dest;
+    dest = NULL;
+    rc = 0;
+
+done:
+    free(dest);
     free(out);
+    free(id);
     hls_ctx_free(c);
     return rc;
 }
 
 /* ------------------------------------------------------------------ */
+/* The best video within the height cap. Variants without a resolution
+   (usually audio-only) are chosen only when no variant gives one. */
 static int pick_variant(const hls_variant *v, int n, int max_height)
 {
-    int best = -1;
+    int best = -1, any_res = 0;
+    for (int i = 0; i < n; i++) if (v[i].height > 0) any_res = 1;
     for (int i = 0; i < n; i++) {
+        if (any_res && v[i].height <= 0) continue;
         if (max_height > 0 && v[i].height > max_height) continue;
         if (best < 0 || v[i].height > v[best].height ||
             (v[i].height == v[best].height && v[i].bw > v[best].bw))
             best = i;
     }
-    if (best < 0) {  /* everything is above the cap: take the smallest */
-        for (int i = 0; i < n; i++)
-            if (best < 0 || v[i].height < v[best].height) best = i;
+    if (best < 0) {  /* every video is above the cap: take the smallest */
+        for (int i = 0; i < n; i++) {
+            if (any_res && v[i].height <= 0) continue;
+            if (best < 0 || v[i].height < v[best].height ||
+                (v[i].height == v[best].height && v[i].bw > v[best].bw))
+                best = i;
+        }
     }
-    return best;
+    return best < 0 ? 0 : best;
 }
 
 static char *default_base(const ul_config *cfg, const char *url)
 {
     char *fn = url_filename(url);
     char *stem = fn ? path_strip_ext(fn) : xstrdup("video");
+    /* "clip.mp4.m3u8" -> "clip" (it became "clip.mp4.mp4") */
+    static const char *media_ext[] = { ".mp4", ".ts", ".m4s", ".m4v", ".aac", ".m4a", ".mkv", ".webm", ".mov" };
+    for (size_t i = 0; i < sizeof media_ext / sizeof *media_ext; i++) {
+        size_t sl = strlen(stem), el = strlen(media_ext[i]);
+        if (sl > el && str_iends(stem, media_ext[i])) { stem[sl - el] = 0; break; }
+    }
     static const char *generic[] = { "index", "master", "playlist", "prog_index", "chunklist",
                                      "manifest", "main", "video", "stream", "media", "mono" };
     int is_generic = 0;
@@ -724,6 +888,32 @@ static char *default_base(const ul_config *cfg, const char *url)
     return base;
 }
 
+/* a download of this name is paused (its segment cache is still there) */
+static int hls_cache_exists(const char *base)
+{
+    static const char *sfx[] = { ".ulhls", ".video.ulhls", ".audio.ulhls" };
+    for (size_t i = 0; i < sizeof sfx / sizeof *sfx; i++) {
+        char *p = xasprintf("%s%s", base, sfx[i]);
+        int e = dir_exists(p);
+        free(p);
+        if (e) return 1;
+    }
+    return 0;
+}
+
+/* a finished (or finishing) file already has this name */
+static int hls_name_used(const char *base)
+{
+    static const char *sfx[] = { ".mp4", ".ts", ".aac", ".mp4.ulpart", ".ts.ulpart", ".aac.ulpart" };
+    for (size_t i = 0; i < sizeof sfx / sizeof *sfx; i++) {
+        char *p = xasprintf("%s%s", base, sfx[i]);
+        int e = file_exists(p);
+        free(p);
+        if (e) return 1;
+    }
+    return 0;
+}
+
 int hls_run(http_session *s, const ul_config *cfg, const char *url, const ul_headers *hd, const char *hint)
 {
     ul_task *t = http_task(s);
@@ -743,14 +933,20 @@ int hls_run(http_session *s, const ul_config *cfg, const char *url, const ul_hea
         base = path_strip_ext(hint);
     } else {
         base = default_base(cfg, url);
-        char *mp4 = xasprintf("%s.mp4", base), *ts = xasprintf("%s.ts", base), *cache = xasprintf("%s.ulhls", base);
-        if (!cfg->overwrite && !dir_exists(cache) && (file_exists(mp4) || file_exists(ts))) {
-            char *u = unique_path(mp4);
-            free(base);
-            base = path_strip_ext(u);
-            free(u);
+        /* A free name: never one another download is saving into right now
+           (its segment folder is locked), and never an earlier finished
+           file - "name (N)" instead. A paused "name (N)" has no file yet
+           and an unlocked folder, so it is picked up again and resumes. */
+        char *b = xstrdup(base);
+        for (int i = 1; i < 100000; i++) {
+            int busy = hls_cache_busy(b);
+            int used = !cfg->overwrite && !hls_cache_exists(b) && hls_name_used(b);
+            if (!busy && !used) break;
+            free(b);
+            b = xasprintf("%s (%d)", base, i);
         }
-        free(mp4); free(ts); free(cache);
+        free(base);
+        base = b;
     }
     tlog(t, LOG_HEAD, "%s", path_basename(base));
 
@@ -768,12 +964,15 @@ int hls_run(http_session *s, const ul_config *cfg, const char *url, const ul_hea
             if (v[b].height) tlog(t, LOG_DIM, "  quality: %dx%d, %.1f Mbps (best of %d)", v[b].width,
                                     v[b].height, (double)v[b].bw / 1e6, nv);
             if (v[b].audio_group) {
+                /* the DEFAULT rendition of the group, else its first one */
                 int pick = -1;
                 for (int i = 0; i < na; i++) {
                     const char *g = agrp[i][0] == '*' ? agrp[i] + 1 : agrp[i];
-                    if (strcmp(g, v[b].audio_group) == 0 && (pick < 0 || agrp[i][0] == '*')) pick = i;
+                    if (strcmp(g, v[b].audio_group) != 0) continue;
+                    if (pick < 0 || (agrp[i][0] == '*' && agrp[pick][0] != '*')) pick = i;
                 }
-                if (pick >= 0) audio_url = xstrdup(aurl[pick]);
+                /* no URI: the audio is already inside the video stream */
+                if (pick >= 0 && aurl[pick]) audio_url = xstrdup(aurl[pick]);
             }
         }
         for (int i = 0; i < nv; i++) { free(v[i].url); free(v[i].audio_group); }
@@ -788,50 +987,48 @@ int hls_run(http_session *s, const ul_config *cfg, const char *url, const ul_hea
     if (!media_url) { free(base); return 1; }
 
     char *ffmpeg = find_tool("ffmpeg.exe");
-    char *mp4 = xasprintf("%s.mp4", base);
     int rc;
     if (audio_url) {
+        char *target = hint ? xstrdup(hint) : xasprintf("%s.mp4", base);
         char *vb = xasprintf("%s.video", base), *ab = xasprintf("%s.audio", base);
         char *vout = NULL, *aout = NULL;
-        rc = hls_fetch_media(s, cfg, hd, media_url, NULL, vb, "video: ", &vout);
-        if (rc == 0) rc = hls_fetch_media(s, cfg, hd, audio_url, NULL, ab, "audio: ", &aout);
+        rc = hls_fetch_media(s, cfg, hd, media_url, NULL, vb, "video: ", NULL, NULL, &vout);
+        if (rc == 0) rc = hls_fetch_media(s, cfg, hd, audio_url, NULL, ab, "audio: ", NULL, NULL, &aout);
         if (rc == 0) {
             if (ffmpeg) {
                 tlog(t, LOG_DIM, "  merging audio + video with ffmpeg...");
-                if (ffmpeg_merge(ffmpeg, vout, aout, mp4, t) == 0) {
+                task_set_file(t, path_basename(target), target);
+                task_set_stage(t, "%s", "merging");
+                task_progress(t);
+                if (ffmpeg_merge(ffmpeg, vout, aout, target, t) == 0) {
                     file_delete(vout);
                     file_delete(aout);
-                    tlog(t, LOG_DIM, "  Saved to %s", mp4);
+                    t->done = t->total = file_size(target);
+                    tlog(t, LOG_DIM, "  Saved to %s", target);
+                } else if (task_aborted(t)) {
+                    tlog(t, LOG_WARN, "paused - start it again to finish merging.");
+                    rc = 2;
                 } else {
                     tlog(t, LOG_WARN, "ffmpeg merge failed; kept %s and %s", vout, aout);
+                    task_set_file(t, path_basename(vout), vout);
+                    if (hint) rc = 1;                /* the caller needs exactly `hint` */
                 }
+                task_set_stage(t, "%s", "");
             } else {
                 tlog(t, LOG_WARN, "audio and video are separate files. Install ffmpeg to merge them automatically.");
                 tlog(t, LOG_DIM, "  Saved %s", vout);
                 tlog(t, LOG_DIM, "  Saved %s", aout);
+                task_set_file(t, path_basename(vout), vout);
             }
         }
-        free(vb); free(ab); free(vout); free(aout);
+        free(vb); free(ab); free(vout); free(aout); free(target);
     } else {
         char *out = NULL;
-        rc = hls_fetch_media(s, cfg, hd, media_url, media_text, base, "", &out);
-        if (rc == 0) {
-            if (ffmpeg && str_iends(out, ".ts")) {
-                tlog(t, LOG_DIM, "  converting to .mp4 with ffmpeg...");
-                if (ffmpeg_remux(ffmpeg, out, mp4, t) == 0) {
-                    file_delete(out);
-                    tlog(t, LOG_DIM, "  Saved to %s", mp4);
-                } else {
-                    tlog(t, LOG_WARN, "ffmpeg conversion failed; kept %s", out);
-                }
-            } else {
-                tlog(t, LOG_DIM, "  Saved to %s", out);
-            }
-        }
+        rc = hls_fetch_media(s, cfg, hd, media_url, media_text, base, "", hint, ffmpeg, &out);
+        if (rc == 0) tlog(t, LOG_DIM, "  Saved to %s", out);
         free(out);
     }
     free(ffmpeg);
-    free(mp4);
     free(media_url);
     free(audio_url);
     free(media_text);

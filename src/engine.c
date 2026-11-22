@@ -56,12 +56,23 @@ struct dl_ctx {
     volatile LONG     fatal;
     volatile LONG     changed;        /* file changed on the server: start over next time */
     volatile LONG     range_refused;  /* a connection was refused a byte range */
+    volatile LONG     nreq;           /* range requests made (the file came in pieces) */
     char              last_err[256];
     char             *etag;
     char             *lastmod;
 };
 
 #define ABORTED(c) (task_aborted((c)->t) || (c)->fatal)
+
+/* a wait that also ends when another connection hit a fatal error */
+static void ctx_sleep(dl_ctx *c, DWORD ms)
+{
+    while (ms > 0 && !ABORTED(c)) {
+        DWORD step = ms > 100 ? 100 : ms;
+        Sleep(step);
+        ms -= step;
+    }
+}
 
 /* ------------------------------------------------------------------ */
 static void set_err(dl_ctx *c, const char *msg)
@@ -104,7 +115,7 @@ static void throttle(dl_ctx *c, int64_t n)
     double now = now_sec();
     if (due > now) {
         double ms = (due - now) * 1000.0;
-        task_sleep(c->t, (DWORD)(ms > 5000 ? 5000 : ms));
+        ctx_sleep(c, (DWORD)(ms > 5000 ? 5000 : ms));
     }
 }
 
@@ -202,6 +213,7 @@ static int fetch_once(dl_ctx *c, int si, char *buf, DWORD bufsz, char *err, size
             pos = 0;
         }
         const char *u = c->use_orig ? c->job->url : c->url;
+        InterlockedIncrement(&c->nreq);
         int rq = http_request(c->s, u, c->job->headers, from, req_to, 0, &r, err, errlen);
         if (rq != 0) return rq == -2 ? FETCH_GIVEUP : FETCH_RETRY;
         int ok;
@@ -209,8 +221,8 @@ static int fetch_once(dl_ctx *c, int si, char *buf, DWORD bufsz, char *err, size
             ok = (r.status == 206 && r.range_start == from &&
                   (r.range_total < 0 || r.range_total == c->total)) ||
                  (r.status == 200 && from == 0 && (r.content_length < 0 || r.content_length == c->total));
-        else
-            ok = r.status == 200 || (r.status == 206 && r.range_start <= 0);
+        else   /* a 206 without a Content-Range is a slice of unknown place, not the file */
+            ok = r.status == 200 || (r.status == 206 && r.range_start == 0);
         /* the same file? (a file replaced on the server must not be mixed in) */
         if (ok && c->ranges && changed_on_server(c, &r)) {
             snprintf(err, errlen, "the file on the server changed during the download");
@@ -298,9 +310,8 @@ static int fetch_once(dl_ctx *c, int si, char *buf, DWORD bufsz, char *err, size
             throttle(c, take);
         }
         if (take < (int64_t)got || pos >= end) {          /* segment done or shrunk */
-            if (c->total < 0 && take < (int64_t)got) {    /* more data than expected */
+            if (take < (int64_t)got && c->total >= 0 && pos >= c->total)   /* past the end of the file */
                 snprintf(err, errlen, "server sent more data than announced");
-            }
             break;
         }
         if (ABORTED(c)) { result = FETCH_STOP; break; }
@@ -351,7 +362,7 @@ static unsigned __stdcall worker_main(void *arg)
         attempt++;
         if (r == FETCH_GIVEUP && attempt >= 2) break;
         if (attempt > c->cfg->retries) break;
-        task_sleep(c->t, (DWORD)(attempt < 16 ? 500 * attempt : 8000));
+        ctx_sleep(c, (DWORD)(attempt < 16 ? 500 * attempt : 8000));
     }
     if (si >= 0) release_segment(c, si);   /* let another connection finish it */
     free(buf);
@@ -363,18 +374,27 @@ static unsigned __stdcall worker_main(void *arg)
 /* ------------------------------------------------------------------ */
 static void save_state(dl_ctx *c, const char *path)
 {
+    /* Snapshot first, flush second: a worker moves a segment forward only
+       after its bytes were written, so everything this snapshot claims is
+       in the file and the flush puts it on the disk. (Flushing first let
+       the state claim bytes written after the flush - holes after a power
+       cut.) */
+    seg_t snap[MAX_SEGS];
+    EnterCriticalSection(&c->lock);
+    int n = c->nsegs;
+    memcpy(snap, c->segs, sizeof(seg_t) * (size_t)n);
+    int64_t total = c->total;
+    LeaveCriticalSection(&c->lock);
+    if (!FlushFileBuffers(c->file)) return;          /* keep the older, still true state */
+
     char *tmp = xasprintf("%s.tmp", path);
     FILE *f = fopen_u8(tmp, "wb");
     if (!f) { free(tmp); return; }
-    /* make sure everything the state claims is really on disk */
-    FlushFileBuffers(c->file);
     fprintf(f, "ULSTATE 1\nurl %s\ntotal %lld\netag %s\nlastmod %s\n", c->job->url,
-            (long long)c->total, c->etag ? c->etag : "", c->lastmod ? c->lastmod : "");
-    EnterCriticalSection(&c->lock);
-    for (int i = 0; i < c->nsegs; i++)
-        if (c->segs[i].pos < c->segs[i].end)
-            fprintf(f, "seg %lld %lld\n", (long long)c->segs[i].pos, (long long)c->segs[i].end);
-    LeaveCriticalSection(&c->lock);
+            (long long)total, c->etag ? c->etag : "", c->lastmod ? c->lastmod : "");
+    for (int i = 0; i < n; i++)
+        if (snap[i].pos < snap[i].end)
+            fprintf(f, "seg %lld %lld\n", (long long)snap[i].pos, (long long)snap[i].end);
     fprintf(f, "end\n");
     int ok = fflush(f) == 0;
     if (fclose(f) != 0) ok = 0;
@@ -472,7 +492,7 @@ static void publish(dl_ctx *c, double speed)
     if (total > 0) {
         done = total - rem;
         for (int i = 0; i < UL_SEGVIEW; i++) {
-            int64_t a = total * i / UL_SEGVIEW, b = total * (i + 1) / UL_SEGVIEW, miss = 0;
+            int64_t a = share_of(total, i, UL_SEGVIEW), b = share_of(total, i + 1, UL_SEGVIEW), miss = 0;
             for (int k = 0; k < n; k++) {
                 int64_t lo = snap[k].pos > a ? snap[k].pos : a;
                 int64_t hi = snap[k].end < b ? snap[k].end : b;
@@ -536,6 +556,40 @@ static int sample_matches(dl_ctx *c, const char *part)
     if (f) fclose(f);
     free(local);
     free(remote);
+    return same;
+}
+
+/* Without an ETag nothing told us the file stayed the same while it came
+   in pieces (several connections, retries, an earlier run). Compare a few
+   spots of the finished file with what the server has now: a file that
+   was replaced meanwhile is a mix of two versions and must not be kept.
+   Returns 0 only when a spot definitely differs. */
+static int spots_match(dl_ctx *c, const char *part)
+{
+    if (c->total <= 0) return 1;
+    FILE *f = fopen_u8(part, "rb");
+    if (!f) return 1;
+    enum { SPOT = 4096, SPOTS = 8 };
+    char *local = xmalloc(SPOT);
+    int same = 1;
+    int64_t last = -1;
+    for (int k = 0; k < SPOTS && same && !task_aborted(c->t); k++) {
+        int64_t from = share_of(c->total, k, SPOTS);
+        if (from == last) continue;
+        last = from;
+        int64_t len = c->total - from < SPOT ? c->total - from : SPOT;
+        if (len <= 0) continue;
+        char err[256];
+        size_t got = 0;
+        char *remote = http_get_body(c->s, c->url, c->job->headers, from, from + len - 1, 0, &got, NULL, 1,
+                                     err, sizeof err, NULL);
+        if (!remote) continue;                        /* cannot tell from this spot */
+        if (_fseeki64(f, from, SEEK_SET) == 0 && fread(local, 1, (size_t)len, f) == (size_t)len)
+            same = got == (size_t)len && memcmp(local, remote, (size_t)len) == 0;
+        free(remote);
+    }
+    free(local);
+    fclose(f);
     return same;
 }
 
@@ -655,7 +709,16 @@ static int dl_run_once(http_session *s, const ul_config *cfg, const dl_job *job,
         set_sparse(c->file, TRUE);
         LARGE_INTEGER li;
         li.QuadPart = c->total;
-        if (SetFilePointerEx(c->file, li, NULL, FILE_BEGIN)) SetEndOfFile(c->file);
+        if (!SetFilePointerEx(c->file, li, NULL, FILE_BEGIN) || !SetEndOfFile(c->file)) {
+            /* e.g. a FAT32 drive and a file over 4 GB: say so now, not at 99% */
+            tlog(t, LOG_ERR, "cannot make room for %s on this drive: %s", fmt_size(c->total, a, sizeof a),
+                 win_errstr(GetLastError(), err, sizeof err));
+            CloseHandle(c->file);
+            c->file = INVALID_HANDLE_VALUE;
+            file_delete(part);
+            http_close(&probe);
+            goto out;
+        }
     }
 
     int conns = c->ranges ? job->connections : 1;
@@ -673,10 +736,9 @@ static int dl_run_once(http_session *s, const ul_config *cfg, const dl_job *job,
             n = conns < maxn ? conns : (int)(maxn > 0 ? maxn : 1);
         }
         c->nsegs = n;
-        int64_t total = c->total >= 0 ? c->total : INT64_MAX;
         for (int i = 0; i < n; i++) {
-            c->segs[i].pos = c->total >= 0 ? total * i / n : 0;
-            c->segs[i].end = c->total >= 0 ? total * (i + 1) / n : INT64_MAX;
+            c->segs[i].pos = c->total >= 0 ? share_of(c->total, i, n) : 0;
+            c->segs[i].end = c->total >= 0 ? share_of(c->total, i + 1, n) : INT64_MAX;
             c->segs[i].owner = -1;
         }
         c->handoff = xmalloc(sizeof(http_response));
@@ -701,6 +763,10 @@ static int dl_run_once(http_session *s, const ul_config *cfg, const dl_job *job,
     /* start workers */
     ws = xcalloc((size_t)conns, sizeof(worker_t));
     c->t0 = now_sec();
+    /* Every first owner is set before any thread runs. Otherwise a worker
+       that finishes early "adopts" a segment whose worker has not started
+       yet, and two connections write the same bytes. */
+    EnterCriticalSection(&c->lock);
     for (int i = 0; i < conns; i++) {
         ws[i].c = c;
         ws[i].id = i;
@@ -709,9 +775,12 @@ static int dl_run_once(http_session *s, const ul_config *cfg, const dl_job *job,
             ws[i].seg = i;
             c->segs[i].owner = i;
         }
+    }
+    LeaveCriticalSection(&c->lock);
+    for (int i = 0; i < conns; i++) {
         ws[i].thread = (HANDLE)_beginthreadex(NULL, 0, worker_main, &ws[i], 0, NULL);
         if (ws[i].thread) th[nth++] = ws[i].thread;
-        else if (ws[i].seg >= 0) c->segs[i].owner = -1;
+        else if (ws[i].seg >= 0) release_segment(c, ws[i].seg);   /* another worker takes it */
     }
     if (nth == 0) {
         tlog(t, LOG_ERR, "cannot start download threads");
@@ -751,17 +820,28 @@ static int dl_run_once(http_session *s, const ul_config *cfg, const dl_job *job,
         li.QuadPart = c->total;
         if (SetFilePointerEx(c->file, li, NULL, FILE_BEGIN)) SetEndOfFile(c->file);
         set_sparse(c->file, FALSE);
-        FILETIME ft;                      /* keep the server's date, like wget/IDM */
-        if (http_date_to_filetime(c->lastmod, &ft)) SetFileTime(c->file, NULL, NULL, &ft);
+        /* the file is dated when it was downloaded - now - (created and
+           modified), never with the server's "last modified" date */
+        FILETIME now;
+        GetSystemTimeAsFileTime(&now);
+        SetFileTime(c->file, &now, NULL, &now);
         FlushFileBuffers(c->file);
         CloseHandle(c->file);
         c->file = INVALID_HANDLE_VALUE;
-        if (file_rename(part, job->path) != 0) {
+        if (c->ranges && (!c->etag || !*c->etag) && c->nreq > 0 && !spots_match(c, part)) {
+            file_delete(state);
+            file_delete(part);
+            tlog(t, LOG_ERR, "the file on the server changed during the download (the server gives no version "
+                             "tag to notice that sooner) - the mixed data was discarded; start it again to get "
+                             "the new version.");
+            rc = 1;
+        } else if (file_rename(part, job->path) != 0) {
             tlog(t, LOG_ERR, "download finished but could not rename %s: %s", part,
                  win_errstr(GetLastError(), err, sizeof err));
             rc = 1;
         } else {
             file_delete(state);
+            file_meta_write(job->path, c->etag, c->lastmod);   /* for "already downloaded" checks */
             tlog(t, LOG_OK, "  Done: %s in %.1fs (avg %s/s)", fmt_size(c->total, a, sizeof a), elapsed,
                  fmt_size((int64_t)(elapsed > 0 ? (double)c->sess_bytes / elapsed : 0), b, sizeof b));
             tlog(t, LOG_DIM, "  Saved to %s", job->path);

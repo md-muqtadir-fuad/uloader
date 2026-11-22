@@ -6,6 +6,7 @@
  */
 #include "uloader.h"
 #include <shellapi.h>
+#include <errno.h>
 
 static void usage(void)
 {
@@ -107,12 +108,31 @@ static void interactive(ul_config *cfg)
             http_session_free(s);
             task_free(tk);
         } else {
-            /* several links may be pasted at once */
-            char *save = NULL;
-            for (char *tok = strtok_r(t, " \t\r\n", &save); tok; tok = strtok_r(NULL, " \t\r\n", &save)) {
-                run_one(cfg, tok, NULL);
-                if (g_abort) break;
+            /* A path with spaces (C:\My Files\x.torrent, maybe in quotes,
+               as Explorer's "Copy as path" gives it) is one item;
+               otherwise several links may be pasted at once. */
+            size_t tl = strlen(t);
+            char *whole = (tl >= 2 && t[0] == '"' && t[tl - 1] == '"') ? xstrndup(t + 1, tl - 2) : xstrdup(t);
+            if (strchr(whole, ' ') && file_exists(whole)) {
+                run_one(cfg, whole, NULL);
+            } else {
+                char *p = t;
+                while (*p && !g_abort) {
+                    while (*p == ' ' || *p == '\t') p++;
+                    if (!*p) break;
+                    char *tok;
+                    if (*p == '"') {                      /* "quoted item" */
+                        tok = ++p;
+                        while (*p && *p != '"') p++;
+                    } else {
+                        tok = p;
+                        while (*p && *p != ' ' && *p != '\t') p++;
+                    }
+                    if (*p) *p++ = 0;
+                    if (*tok) run_one(cfg, tok, NULL);
+                }
             }
+            free(whole);
         }
         InterlockedExchange(&g_abort, 0);
         free(line);
@@ -154,6 +174,27 @@ static const char *need_value(int argc, char **argv, int *i, const char *inline_
         exit(1);
     }
     return argv[++*i];
+}
+
+/* a whole number, nothing else ("8x", "" or "abc" are mistakes, not 0) */
+static int int_value(const char *v, const char *opt, long lo, long hi)
+{
+    char *e;
+    errno = 0;
+    long x = strtol(v, &e, 10);
+    while (*e == ' ') e++;
+    if (e == v || *e || errno == ERANGE || x < lo || x > hi) {
+        ul_log(LOG_ERR, "bad value for %s: \"%s\" (a number from %ld to %ld)", opt, v, lo, hi);
+        exit(1);
+    }
+    return (int)x;
+}
+
+/* the last of repeated options wins; the earlier value is freed */
+static void set_str(char **dst, const char *v)
+{
+    free(*dst);
+    *dst = xstrdup(v);
 }
 
 static int read_url_file(const char *path, char ***urls, int *n)
@@ -209,16 +250,20 @@ int main(void)
         if (a[1] == '-' && (eq = strchr(a, '=')) != NULL) *eq++ = 0;
         const char *v;
 #define OPT(s, l) (!strcmp(a, s) || !strcmp(a, l))
+        /* a switch never takes "=value": "--insecure=0" must not switch it ON */
+        static const char *switches[] = { "-h", "--help", "-v", "--version", "-k", "--insecure", "--playlist",
+                                          "--overwrite", "--direct", "--ytdlp", "--get-ytdlp", "--install",
+                                          "--uninstall" };
+        for (size_t k = 0; eq && k < sizeof switches / sizeof *switches; k++)
+            if (!strcmp(a, switches[k])) { ul_log(LOG_ERR, "option %s does not take a value", a); return 1; }
         if (OPT("-h", "--help")) { usage(); return 0; }
         else if (OPT("-v", "--version")) { printf("%s %s\n", UL_NAME, UL_VERSION); return 0; }
         else if (OPT("-c", "--connections")) {
-            v = need_value(argc, argv, &i, eq, a);
-            cfg.connections = atoi(v);
-            if (cfg.connections < 1) cfg.connections = 1;
+            cfg.connections = int_value(need_value(argc, argv, &i, eq, a), a, 1, 1000000);
             if (cfg.connections > UL_MAX_CONN) cfg.connections = UL_MAX_CONN;
         }
-        else if (OPT("-d", "--dir"))         { free(cfg.out_dir); cfg.out_dir = xstrdup(need_value(argc, argv, &i, eq, a)); }
-        else if (OPT("-o", "--output"))      { free(cfg.out_name); cfg.out_name = xstrdup(need_value(argc, argv, &i, eq, a)); }
+        else if (OPT("-d", "--dir"))         set_str(&cfg.out_dir, need_value(argc, argv, &i, eq, a));
+        else if (OPT("-o", "--output"))      set_str(&cfg.out_name, need_value(argc, argv, &i, eq, a));
         else if (OPT("-i", "--input")) {
             v = need_value(argc, argv, &i, eq, a);
             int before = nurls;
@@ -230,34 +275,35 @@ int main(void)
             cfg.speed_limit = parse_size(v);
             if (cfg.speed_limit < 0) { ul_log(LOG_ERR, "bad speed limit: %s", v); return 1; }
         }
-        else if (OPT("-q", "--quality"))     cfg.max_height = atoi(need_value(argc, argv, &i, eq, a));
-        else if (OPT("-f", "--format"))      cfg.format = xstrdup(need_value(argc, argv, &i, eq, a));
+        else if (OPT("-q", "--quality"))     cfg.max_height = int_value(need_value(argc, argv, &i, eq, a), a, 0, 100000);
+        else if (OPT("-f", "--format"))      set_str(&cfg.format, need_value(argc, argv, &i, eq, a));
         else if (OPT("-H", "--header")) {
             v = need_value(argc, argv, &i, eq, a);
             if (!strchr(v, ':') || strpbrk(v, "\r\n")) { ul_log(LOG_ERR, "header must look like \"Name: value\""); return 1; }
             if (cfg.nheaders < UL_MAX_HEADERS) cfg.headers[cfg.nheaders++] = xstrdup(v);
         }
-        else if (OPT("-U", "--user-agent"))  cfg.user_agent = xstrdup(need_value(argc, argv, &i, eq, a));
-        else if (OPT("-r", "--referer"))     cfg.referer = xstrdup(need_value(argc, argv, &i, eq, a));
-        else if (OPT("-b", "--cookie"))      cfg.cookie = xstrdup(need_value(argc, argv, &i, eq, a));
+        else if (OPT("-U", "--user-agent"))  set_str(&cfg.user_agent, need_value(argc, argv, &i, eq, a));
+        else if (OPT("-r", "--referer"))     set_str(&cfg.referer, need_value(argc, argv, &i, eq, a));
+        else if (OPT("-b", "--cookie"))      set_str(&cfg.cookie, need_value(argc, argv, &i, eq, a));
         else if (!strcmp(a, "--cookies")) {
             v = need_value(argc, argv, &i, eq, a);
             if (cookies_load(&cfg, v) < 0) { ul_log(LOG_ERR, "cannot read cookies file %s", v); return 1; }
-            cfg.cookie_file = xstrdup(v);
+            set_str(&cfg.cookie_file, v);
         }
-        else if (OPT("-x", "--proxy"))       cfg.proxy = xstrdup(need_value(argc, argv, &i, eq, a));
+        else if (OPT("-x", "--proxy"))       set_str(&cfg.proxy, need_value(argc, argv, &i, eq, a));
         else if (OPT("-k", "--insecure"))    cfg.insecure = 1;
-        else if (OPT("-R", "--retries"))     cfg.retries = atoi(need_value(argc, argv, &i, eq, a));
-        else if (OPT("-t", "--timeout"))     cfg.timeout_sec = atoi(need_value(argc, argv, &i, eq, a));
+        else if (OPT("-R", "--retries"))     cfg.retries = int_value(need_value(argc, argv, &i, eq, a), a, 0, 1000000);
+        else if (OPT("-t", "--timeout"))     cfg.timeout_sec = int_value(need_value(argc, argv, &i, eq, a), a, 1, 1000000);
         else if (!strcmp(a, "--playlist"))   cfg.playlist = 1;
         else if (!strcmp(a, "--overwrite"))  cfg.overwrite = 1;
-        else if (!strcmp(a, "--direct"))     cfg.force_direct = 1;
-        else if (!strcmp(a, "--ytdlp"))      cfg.force_ytdlp = 1;
-        else if (!strcmp(a, "--ytdlp-args")) cfg.ytdlp_args = xstrdup(need_value(argc, argv, &i, eq, a));
+        /* --direct / --ytdlp exclude each other: the later one wins */
+        else if (!strcmp(a, "--direct"))     { cfg.force_direct = 1; cfg.force_ytdlp = 0; }
+        else if (!strcmp(a, "--ytdlp"))      { cfg.force_ytdlp = 1; cfg.force_direct = 0; }
+        else if (!strcmp(a, "--ytdlp-args")) set_str(&cfg.ytdlp_args, need_value(argc, argv, &i, eq, a));
         else if (!strcmp(a, "--get-ytdlp"))  get_ytdlp = 1;
         else if (!strcmp(a, "--install"))    install = 0;
         else if (!strcmp(a, "--uninstall"))  install = 1;
-        else if (!strcmp(a, "--job"))        job = xstrdup(need_value(argc, argv, &i, eq, a));
+        else if (!strcmp(a, "--job"))        set_str(&job, need_value(argc, argv, &i, eq, a));
         else { ul_log(LOG_ERR, "unknown option %s (see uloader --help)", a); return 1; }
 #undef OPT
     }
@@ -266,7 +312,11 @@ int main(void)
     if (cfg.timeout_sec < 5) cfg.timeout_sec = 5;
 
     if (install >= 0) return host_install(install);
-    if (job) return run_job(&cfg, job);
+    if (job) {
+        int jr = run_job(&cfg, job);
+        torrent_flush_announces(3000);
+        return jr;
+    }
 
     int interactive_mode = nurls == 0 && !get_ytdlp;
     if (!cfg.out_dir) cfg.out_dir = interactive_mode ? downloads_dir() : xstrdup(".");
@@ -304,5 +354,6 @@ int main(void)
         if (paused) rc = 2;
         else if (failed) rc = 1;
     }
+    torrent_flush_announces(3000);          /* let a torrent's "stopped" reach its trackers */
     return rc;
 }

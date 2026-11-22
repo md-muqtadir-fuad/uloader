@@ -16,6 +16,9 @@ Paths (FILE is a file name inside ROOTDIR):
   /busy/FILE         every 2nd request answers 503
   /cd/FILE?name=X    Content-Disposition: attachment; filename="X"
   /cdstar/FILE?name=X  Content-Disposition with filename*=UTF-8''X
+  /cdraw/FILE?h=X    Content-Disposition: X (exactly as given)
+  /setcookie/FILE    302 to /needcookie/FILE with Set-Cookie: ulgate=open
+  /needcookie/FILE   /r/FILE, but 403 without the ulgate cookie
   /empty             a zero-byte file (ranges supported)
   /page              an HTML page
   /status/CODE       answers with that status code
@@ -158,6 +161,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect(nxt)
         if head == "xhost" and len(parts) == 2:
             return self.redirect("http://localhost:%d/r/%s" % (PORT, parts[1]))
+        if head == "setcookie" and len(parts) == 2:
+            # a gate: sets a cookie on the redirect, the file needs it
+            self.send_response(302)
+            self.send_header("Location", "/needcookie/%s" % parts[1])
+            self.send_header("Set-Cookie", "ulgate=open; Path=/; HttpOnly")
+            self.send_header("Set-Cookie", "ulgone=x; Max-Age=0")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if head == "needcookie" and len(parts) == 2:
+            if "ulgate=open" not in (self.headers.get("Cookie") or ""):
+                return self.simple(403, b"no cookie")
+            return self.send_file(fpath(parts[1]), kbps=kbps)
         if head == "loop":
             return self.redirect("/loop")
         if head == "drop" and len(parts) == 2:
@@ -169,9 +185,11 @@ class Handler(BaseHTTPRequestHandler):
             if odd:
                 return self.simple(503, b"busy", extra={"Retry-After": "1"})
             return self.send_file(fpath(parts[1]), kbps=kbps)
-        if head in ("cd", "cdstar") and len(parts) == 2:
+        if head in ("cd", "cdstar", "cdraw") and len(parts) == 2:
             name = q.get("name", ["x.bin"])[0]
-            if head == "cd":
+            if head == "cdraw":
+                cd = q.get("h", [""])[0]
+            elif head == "cd":
                 cd = 'attachment; filename="%s"' % name.replace('"', '\\"')
             else:
                 cd = "attachment; filename*=UTF-8''%s" % urllib.parse.quote(name, safe="")
@@ -185,17 +203,24 @@ class Handler(BaseHTTPRequestHandler):
                     '<a id="dl" href="/r/%s">file</a></body></html>' % (parts[1], parts[1]))
             return self.simple(200, html.encode(), ctype="text/html; charset=utf-8")
         if head == "tagpage" and len(parts) == 2:
-            # a player like YouTube's: controls overlay sits on top of the video
+            # a player like YouTube's: controls overlay sits on top of the video (?w=&h= size)
+            w = int(q.get("w", ["640"])[0])
+            h = int(q.get("h", [str(w * 9 // 16)])[0])
+            # ?right=1: the player touches the right edge of the window (thumbnail grids)
+            pos = "position:absolute;right:0;top:40px;" if q.get("right") else "position:relative;"
             html = ('<html><head><title>Video page</title></head><body style="margin:40px;background:#111">'
-                    '<div style="position:relative;width:640px;height:360px">'
-                    '<video id="v" src="/v/%s" style="width:640px;height:360px;background:#000" muted></video>'
+                    '<div style="' + pos + 'width:%dpx;height:%dpx">'
+                    '<video id="v" src="/v/%s" style="width:%dpx;height:%dpx;background:#000" muted></video>'
                     '<div id="overlay" style="position:absolute;inset:0;background:transparent"></div>'
-                    '</div><p style="color:#ccc">Hover the video.</p></body></html>' % parts[1])
+                    '</div><p style="color:#ccc">Hover the video.</p></body></html>' % (w, h, parts[1], w, h))
             return self.simple(200, html.encode(), ctype="text/html; charset=utf-8")
         if head == "v" and len(parts) == 2:
             return self.send_file(fpath(parts[1]), extra={"X-Kind": "video"}, ctype="video/mp4")
         if head == "status" and len(parts) == 2:
             return self.simple(int(parts[1]), b"status")
+        if head == "old" and len(parts) == 2:
+            # a file the server says was last modified in 2019
+            return self.send_file(fpath(parts[1]), extra={"Last-Modified": "Tue, 01 Jan 2019 00:00:00 GMT"})
         if head == "lie" and len(parts) == 2:
             return self.send_file(fpath(parts[1]), ranges=False, lie=1000)
         if head == "toggle" and len(parts) == 2:

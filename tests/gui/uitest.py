@@ -147,7 +147,7 @@ def send_job(main, jobpath):
     res = ctypes.c_size_t()
     ok = user32.SendMessageTimeoutW(main, WM_COPYDATA, 0, ctypes.addressof(cds), SMTO_ABORTIFHUNG, 8000,
                                     ctypes.byref(res))
-    return bool(ok) and res.value != 0
+    return bool(ok) and res.value == 1      # 1 = taken, 2 = refused, 0 = the window is closing
 
 
 def write_job(path, **kv):

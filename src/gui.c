@@ -201,6 +201,7 @@ static void schedule(void);
 static void detail_refresh(int force);
 static void update_toolbar(void);
 static void update_status(void);
+static double g_status_note_until;     /* a status-bar note shows until then */
 static void open_add_dialog(const char *prefill, int topmost);
 static void do_exit(void);
 static void layout(void);
@@ -239,11 +240,19 @@ static void u8w(const char *s, wchar_t *out, int n)
     free(w);
 }
 
-/* "C:\..." or "\\server\share": anything else would depend on our current folder */
+/* "C:\..." or "\\server\share": anything else would depend on our current
+   folder. Backslashes only: the shell (Recycle Bin, Explorer selection)
+   does not take "C:/x" - typed folders go through to_backslashes() first. */
 static int is_abs_path(const char *p)
 {
-    return p && ((isalpha((unsigned char)p[0]) && p[1] == ':' && (p[2] == '\\' || p[2] == '/')) ||
-                 ((p[0] == '\\' || p[0] == '/') && (p[1] == '\\' || p[1] == '/')));
+    return p && ((isalpha((unsigned char)p[0]) && p[1] == ':' && p[2] == '\\') ||
+                 (p[0] == '\\' && p[1] == '\\'));
+}
+
+static char *to_backslashes(char *p)
+{
+    for (char *c = p; c && *c; c++) if (*c == '/') *c = '\\';
+    return p;
 }
 
 static void set_str(char **dst, const char *src)
@@ -409,8 +418,10 @@ static char *video_page_name(const char *url)
     if (str_istarts(h, "www.")) h += 4;
     else if (str_istarts(h, "m.")) h += 2;
     const char *q = strchr(url, '?');
-    const char *v = q ? strstr(q, "v=") : NULL;
-    if (v && (v[-1] == '?' || v[-1] == '&')) {
+    const char *v = NULL;                 /* the "v" parameter, not the end of "...v=" (nav=, dev=) */
+    for (const char *p = q; p && (p = strstr(p, "v=")) != NULL; p += 2)
+        if (p[-1] == '?' || p[-1] == '&') { v = p; break; }
+    if (v) {
         size_t idl = strcspn(v + 2, "&#");
         if (idl > 0 && idl < 40) {
             char *r = xasprintf("%s video (%.*s)", h, (int)idl, v + 2);
@@ -563,7 +574,9 @@ static FILE *begin_write(const char *name, char **path, char **tmp)
 
 static int end_write(FILE *f, char *path, char *tmp)
 {
-    int ok = fflush(f) == 0;
+    /* any failed write (disk full) must keep the old file, never replace
+       it with a cut-off one */
+    int ok = fflush(f) == 0 && !ferror(f);
     if (fclose(f) != 0) ok = 0;
     if (ok) {
         /* the old file may be open in another program for a moment (virus
@@ -631,7 +644,11 @@ static void settings_load(void)
         *eq = 0;
         char *k = line, *v = eq + 1;
         int iv[NCOLS + 1];
-        if (!strcmp(k, "dir")) { if (is_abs_path(v)) set_str(&g_set.dir, v); }
+        if (!strcmp(k, "dir")) {
+            char *dd = to_backslashes(xstrdup(v));
+            if (is_abs_path(dd)) set_str(&g_set.dir, dd);
+            free(dd);
+        }
         else if (!strcmp(k, "connections")) g_set.conns = clampi(atoi(v), 1, UL_MAX_CONN);
         else if (!strcmp(k, "max_active")) g_set.max_active = clampi(atoi(v), 1, 20);
         else if (!strcmp(k, "speed_limit_kb")) g_set.limit_kb = clampi(atoi(v), 0, 10000000);
@@ -877,7 +894,7 @@ static void restore_segmap(item *it)
     int64_t missing = 0;
     for (int k = 0; k < n; k++) missing += (b[k] > total ? total : b[k]) - a[k];
     for (int i = 0; i < UL_SEGVIEW; i++) {
-        int64_t lo0 = total * i / UL_SEGVIEW, hi0 = total * (i + 1) / UL_SEGVIEW, miss = 0;
+        int64_t lo0 = share_of(total, i, UL_SEGVIEW), hi0 = share_of(total, i + 1, UL_SEGVIEW), miss = 0;
         for (int k = 0; k < n; k++) {
             int64_t lo = a[k] > lo0 ? a[k] : lo0, hi = b[k] < hi0 ? b[k] : hi0;
             if (hi > lo) miss += hi - lo;
@@ -1116,7 +1133,10 @@ static int is_bridge_cookie_file(const char *p)
     size_t tl = strlen(td);
     while (tl && (td[tl - 1] == '\\' || td[tl - 1] == '/')) td[--tl] = 0;
     char *dir = path_dirname(p);
-    int ok = _stricmp(dir, td) == 0 && _strnicmp(path_basename(p), "ulc", 3) == 0;
+    size_t dl = strlen(dir);              /* "C:\" (TEMP at a drive root) compares as "C:" too */
+    while (dl && (dir[dl - 1] == '\\' || dir[dl - 1] == '/')) dir[--dl] = 0;
+    const char *b = path_basename(p);
+    int ok = _stricmp(dir, td) == 0 && _strnicmp(b, "ulc", 3) == 0 && str_iends(b, ".tmp");
     free(dir);
     free(td);
     return ok;
@@ -1203,6 +1223,8 @@ static void schedule(void)
 }
 
 static void tray_balloon(const wchar_t *title, const char *text, DWORD flags);
+static void modal_begin(void);
+static void modal_end(void);
 
 static void finalize_removal(item *it)
 {
@@ -1211,9 +1233,12 @@ static void finalize_removal(item *it)
     if (it->t->path) path = xstrdup(it->t->path);
     LeaveCriticalSection(&it->t->lock);
     int complete = it->state == TS_DONE;
-    if (path) {
+    /* plain Del only takes the row off the list: a paused download's
+       partial data stays (it can be added again and resumes). Shift+Del
+       ("delete the file too") removes it. */
+    if (path && it->removing == 2) {
         if (!complete) delete_partials(path);
-        else if (it->removing == 2 && file_exists(path)) shell_delete(path, 1);   /* to the Recycle Bin */
+        else if (file_exists(path)) shell_delete(path, 1);   /* to the Recycle Bin */
     }
     free(path);
     drop_cookie_file(it);
@@ -1228,7 +1253,11 @@ static void finalize_removal(item *it)
 static void task_finished(item *it)
 {
     if (!it || !it->thread) return;
-    WaitForSingleObject(it->thread, INFINITE);   /* it has already posted: about to return */
+    /* Never wait on the UI thread. A WM_APP_TASKDONE from an earlier run
+       (reaped by the timer, item restarted since) finds the new thread
+       still running and is ignored; a thread that posted but has not quite
+       returned yet is reaped by the next timer tick. */
+    if (WaitForSingleObject(it->thread, 0) != WAIT_OBJECT_0) return;
     CloseHandle(it->thread);
     it->thread = NULL;
     int rc = (int)it->rc;
@@ -1345,6 +1374,8 @@ static void grave_add(item *it)
 static void remove_items(item **v, int n, int with_files)
 {
     int first = -1;
+    item **now = xcalloc((size_t)n + 1, sizeof *now);   /* finalized after the list is consistent */
+    int nnow = 0;
     for (int k = 0; k < n; k++) {
         item *it = v[k];
         int idx = index_of(it);
@@ -1352,14 +1383,19 @@ static void remove_items(item **v, int n, int with_files)
         if (first < 0 || idx < first) first = idx;
         memmove(&g_items[idx], &g_items[idx + 1], sizeof *g_items * (size_t)(g_n - idx - 1));
         g_n--;
+        EnterCriticalSection(&it->loglock);   /* gui_on_log reads it on download threads */
         it->removing = with_files ? 2 : 1;
+        LeaveCriticalSection(&it->loglock);
         grave_add(it);
-        if (it == g_detail_item) g_detail_item = NULL;
         if (it == g_notify_item) g_notify_item = NULL;
         if (it->thread) it->t->abort = 1;      /* finished when the thread ends */
-        else finalize_removal(it);
+        else now[nnow++] = it;
     }
     ListView_SetItemCountEx(g_lv, g_n, 0);
+    /* Deleting files (SHFileOperation) runs a message loop: the list view
+       may repaint meanwhile, so it must already know its new length. */
+    for (int k = 0; k < nnow; k++) finalize_removal(now[k]);
+    free(now);
     ListView_SetItemState(g_lv, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
     if (g_n > 0 && first >= 0) {
         item *next = g_items[first < g_n ? first : g_n - 1];
@@ -1460,8 +1496,12 @@ static void on_clipboard_update(void)
     char *s = clipboard_text();
     if (!s) return;
     char *t = str_trim(s);
-    if (*t && strlen(t) < 8192 && !strpbrk(t, " \t\r\n") && looks_like_download(t) && !link_seen(t, 1))
-        PostMessageW(g_hwnd, WM_APP_CLIPLINK, 0, (LPARAM)xstrdup(t));
+    /* only looked up here: it counts as seen once it was really offered
+       (a link copied while a dialog is open must come back later) */
+    if (*t && strlen(t) < 8192 && !strpbrk(t, " \t\r\n") && looks_like_download(t) && !link_seen(t, 0)) {
+        char *copy = xstrdup(t);
+        if (!PostMessageW(g_hwnd, WM_APP_CLIPLINK, 0, (LPARAM)copy)) free(copy);
+    }
     free(s);
 }
 
@@ -1696,7 +1736,12 @@ static HBITMAP make_dib(int w, int h, DWORD **bits)
 
 static HICON icon_from_dib(HBITMAP color, int w, int h)
 {
-    HBITMAP mask = CreateBitmap(w, h, 1, 1, NULL);
+    /* an all-zero mask (the alpha channel does the work); CreateBitmap
+       with NULL bits leaves the memory undefined. Rows are WORD aligned. */
+    size_t stride = (size_t)((w + 15) / 16) * 2;
+    void *bits = xcalloc(stride * (size_t)(h > 0 ? h : 1), 1);
+    HBITMAP mask = CreateBitmap(w, h, 1, 1, bits);
+    free(bits);
     ICONINFO ii;
     memset(&ii, 0, sizeof ii);
     ii.fIcon = TRUE;
@@ -1801,8 +1846,8 @@ static int icon_for(item *it)
     snprintf(it->icon_ext, sizeof it->icon_ext, "%s", path_ext(it->name));
     for (int i = 0; i < g_nicache; i++)
         if (!_stricmp(g_icache[i].ext, ext)) return it->icon = g_icache[i].index;
-    int isz = metric(SM_CXSMICON), cw, chh;
-    ImageList_GetIconSize(g_il_files, &cw, &chh);
+    int isz = metric(SM_CXSMICON), cw = isz, chh = isz;
+    if (!ImageList_GetIconSize(g_il_files, &cw, &chh)) cw = chh = isz;
     wchar_t name[32] = L"file";
     u8w(ext, name + 4, 28);
     SHFILEINFOW sfi;
@@ -1832,6 +1877,10 @@ static void set_window_icons(void)
     HICON s = LoadImageW(g_inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, small, small, 0);
     if (b) SendMessageW(g_hwnd, WM_SETICON, ICON_BIG, (LPARAM)b);
     if (s) SendMessageW(g_hwnd, WM_SETICON, ICON_SMALL, (LPARAM)s);
+    /* an open dialog shows the old icons too: hand it the new ones before
+       the old ones are destroyed */
+    if (g_dlg && b) SendMessageW(g_dlg, WM_SETICON, ICON_BIG, (LPARAM)b);
+    if (g_dlg && s) SendMessageW(g_dlg, WM_SETICON, ICON_SMALL, (LPARAM)s);
     if (b && g_icon_big) DestroyIcon(g_icon_big);
     if (s && g_icon_small) DestroyIcon(g_icon_small);
     if (b) g_icon_big = b;
@@ -2150,7 +2199,9 @@ static void open_item(item *it)
 {
     if (!it || it->state != TS_DONE) return;
     if (!it->path || !file_exists(it->path)) {
+        modal_begin();                 /* no tray "Exit" underneath the message box */
         MessageBoxW(g_hwnd, L"The file was moved or deleted.", L"U-loader", MB_OK | MB_ICONINFORMATION);
+        modal_end();
         return;
     }
     wchar_t *w = u8_to_w(it->path);
@@ -2200,6 +2251,7 @@ static void paste_links(void)
     if (!links) {
         MessageBeep(MB_ICONWARNING);
         SendMessageW(g_sb, SB_SETTEXTW, 0, (LPARAM)L"The clipboard has no http, https, ftp or magnet links.");
+        g_status_note_until = now_sec() + 4.0;       /* not for good: update_status takes over */
         return;
     }
     char **v;
@@ -2792,6 +2844,12 @@ static void update_status(void)
     wchar_t wa[200], wb[200];
     u8w(a, wa, 200);
     u8w(b, wb, 200);
+    /* a short note (status_note) owns the first part for a few seconds,
+       then the counts come back */
+    if (g_status_note_until > 0) {
+        if (now_sec() < g_status_note_until) wcscpy(wa, last_a);
+        else { g_status_note_until = 0; last_a[0] = 0; }
+    }
     if (wcscmp(wa, last_a)) { SendMessageW(g_sb, SB_SETTEXTW, 0, (LPARAM)wa); wcscpy(last_a, wa); }
     if (wcscmp(wb, last_b)) { SendMessageW(g_sb, SB_SETTEXTW, 1, (LPARAM)wb); wcscpy(last_b, wb); }
 
@@ -2959,7 +3017,7 @@ static INT_PTR CALLBACK add_proc(HWND d, UINT m, WPARAM w, LPARAM l)
                 return TRUE;
             }
             char *dir = dlg_text(d, IDC_DIR);
-            char *dt = str_trim(dir);
+            char *dt = to_backslashes(str_trim(dir));
             if (!is_abs_path(dt)) {
                 free(links);
                 free(dir);
@@ -3211,7 +3269,7 @@ static void settings_refresh(HWND d, unsigned *shown, int *last_busy)
 static int settings_apply(HWND d)
 {
     char *dir = dlg_text(d, IDC_S_DIR);
-    char *dt = str_trim(dir);
+    char *dt = to_backslashes(str_trim(dir));
     BOOL ok1 = FALSE, ok2 = FALSE, ok3 = FALSE;
     UINT conns = GetDlgItemInt(d, IDC_S_CONNS, &ok1, FALSE);
     UINT maxa = GetDlgItemInt(d, IDC_S_MAXACT, &ok2, FALSE);
@@ -3358,6 +3416,7 @@ static int accept_job(const char *path)
     }
     file_delete(path);
     item *it = item_new(url);
+    to_backslashes(cfg->out_dir);
     set_str(&it->dir, is_abs_path(cfg->out_dir) ? cfg->out_dir : g_set.dir);
     set_str(&it->out_name, cfg->out_name);
     set_str(&it->referer, cfg->referer);
@@ -3378,12 +3437,15 @@ static int accept_job(const char *path)
 static void add_plain_links(char **links, int n)
 {
     item **items = xcalloc((size_t)n + 1, sizeof *items);
+    int k = 0;
     for (int i = 0; i < n; i++) {
-        items[i] = item_new(links[i]);
+        if (!links[i]) continue;               /* already handed to another window */
+        items[k] = item_new(links[i]);
         link_seen(links[i], 1);
-        snap_update(items[i]);
+        snap_update(items[k]);
+        k++;
     }
-    add_items(items, n, 1);
+    if (k) add_items(items, k, 1);
     free(items);
     schedule();
 }
@@ -3397,7 +3459,9 @@ static LRESULT on_copydata(const COPYDATASTRUCT *cds)
     int ok = accept_job(path);
     free(path);
     if (ok) show_main();
-    return ok ? TRUE : FALSE;
+    /* 1 = taken, 2 = refused (unreadable job: retrying cannot help);
+       0 (above) = closing, the sender should take over */
+    return ok ? 1 : 2;
 }
 
 /* ------------------------------------------------------------------ */
@@ -3692,9 +3756,20 @@ static void on_command(int id, int code)
         if (code == 1 && GetFocus() != g_lv) break;
         delete_selected(1);
         break;
-    case IDM_OPEN:
-        open_item(focused_item());
+    case IDM_OPEN: {
+        /* "Open" is offered when any selected download is finished: open
+           the focused one if it is, else the first finished one */
+        item *o = focused_item();
+        if (!o || o->state != TS_DONE) {
+            item **sel;
+            int n = selection(&sel);
+            o = NULL;
+            for (int k = 0; k < n && !o; k++) if (sel[k]->state == TS_DONE) o = sel[k];
+            free(sel);
+        }
+        open_item(o);
         break;
+    }
     case IDM_OPENFOLDER:
         open_folder_of(focused_item());
         break;
@@ -3996,6 +4071,8 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             int bottom = rc.bottom - (sr.bottom - sr.top);
             int y = GET_Y_LPARAM(lp) - g_split_grab;
             int dh = bottom - y - split_h();
+            int dmax = bottom - split_h() - S(60);          /* the list keeps some rows */
+            if (dh > dmax) dh = dmax;
             if (dh < info_height()) dh = info_height();     /* the details stay whole */
             g_set.detail_h = MulDiv(dh, 96, (int)g_dpi);
             layout();
@@ -4049,8 +4126,9 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     case WM_APP_CLIPLINK: {
         char *link = (char *)lp;
-        if (g_add_dlg) add_dialog_append(link);
-        else if (!g_modal && !g_exiting) open_add_dialog(link, 1);
+        if (link_seen(link, 0)) { free(link); return 0; }   /* posted twice meanwhile */
+        if (g_add_dlg) { add_dialog_append(link); link_seen(link, 1); }
+        else if (!g_modal && !g_exiting) { link_seen(link, 1); open_add_dialog(link, 1); }
         free(link);
         return 0;
     }
@@ -4129,28 +4207,37 @@ static int send_job(HWND hw, const char *jobpath)
     cds.cbData = (DWORD)strlen(jobpath) + 1;
     cds.lpData = (void *)jobpath;
     DWORD_PTR res = 0;
-    return SendMessageTimeoutW(hw, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG, 8000, &res) && res;
+    if (!SendMessageTimeoutW(hw, WM_COPYDATA, 0, (LPARAM)&cds, SMTO_ABORTIFHUNG, 8000, &res)) return 0;
+    return res == 1 ? 1 : res == 2 ? 2 : 0;   /* see on_copydata */
 }
 
-static int forward_to(HWND hw, const char *job, char **links, int n)
+/* Hand the job / links to the running window. Whatever it answered for
+   is cleared (*job freed, links[i] freed and NULL), so after a hand-over
+   that broke off half-way (the window was closing) only the rest is added
+   here - never twice. Returns 1 when nothing is left to do. */
+static int forward_to(HWND hw, char **job, char **links, int n)
 {
-    int ok = 1;
-    if (job) ok = send_job(hw, job) && ok;
-    for (int i = 0; i < n; i++) {
-        char *jp = job_write(links[i], NULL, NULL, NULL, NULL, NULL, 0, 0, NULL);
-        if (!jp || !send_job(hw, jp)) {
-            if (jp) file_delete(jp);
-            ok = 0;
-        }
-        free(jp);
-    }
-    if (!job && n == 0) {
+    int left = 0;
+    if (!*job && n == 0) {                   /* just "show yourself" */
         DWORD pid = 0;
         GetWindowThreadProcessId(hw, &pid);
         AllowSetForegroundWindow(pid);
-        ok = PostMessageW(hw, WM_APP_SHOW, 0, 0) != 0;
+        return PostMessageW(hw, WM_APP_SHOW, 0, 0) != 0;
     }
-    return ok;
+    if (*job) {
+        if (send_job(hw, *job)) { free(*job); *job = NULL; }   /* taken, or refused for good */
+        else left = 1;
+    }
+    for (int i = 0; i < n; i++) {
+        if (!links[i]) continue;
+        char *jp = job_write(links[i], NULL, NULL, NULL, NULL, NULL, 0, 0, NULL);
+        int r = jp ? send_job(hw, jp) : 0;
+        if (jp && r != 1) file_delete(jp);
+        free(jp);
+        if (r) { free(links[i]); links[i] = NULL; }
+        else left = 1;
+    }
+    return !left;
 }
 
 static void place_window(int start_hidden)
@@ -4247,17 +4334,20 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmdline, int show)
 
     /* one window per user session */
     HANDLE mtx = CreateMutexW(NULL, FALSE, L"Local\\ULoaderWindowSingleInstance");
-    if (mtx) WaitForSingleObject(mtx, 15000);
+    /* owned only when the wait says so (WAIT_ABANDONED: its owner died -
+       ours now); after a timeout it must not be released */
+    int owned = mtx && WaitForSingleObject(mtx, 15000) != WAIT_TIMEOUT;
     HWND other = FindWindowW(UL_GUI_CLASS, NULL);
     if (other) {
-        int ok = forward_to(other, job, links, nlinks);
-        if (mtx) ReleaseMutex(mtx);
-        if (ok) return 0;
-        /* the other window is closing: wait for it, then take over */
+        int done = forward_to(other, &job, links, nlinks);
+        if (owned) ReleaseMutex(mtx);
+        owned = 0;
+        if (done) return 0;
+        /* the other window is closing: wait for it, then take over what it did not take */
         for (int k = 0; k < 80 && IsWindow(other); k++) Sleep(100);
-        if (mtx) WaitForSingleObject(mtx, 15000);
+        owned = mtx && WaitForSingleObject(mtx, 15000) != WAIT_TIMEOUT;
         if (FindWindowW(UL_GUI_CLASS, NULL)) {
-            if (mtx) ReleaseMutex(mtx);
+            if (owned) ReleaseMutex(mtx);
             return 1;
         }
     }
@@ -4296,7 +4386,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmdline, int show)
     g_hwnd = CreateWindowExW(0, UL_GUI_CLASS, L"U-loader", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                              CW_USEDEFAULT, CW_USEDEFAULT, 1000, 650, NULL, NULL, hinst, NULL);
     if (!g_hwnd) {
-        if (mtx) ReleaseMutex(mtx);
+        if (owned) ReleaseMutex(mtx);
         MessageBoxW(NULL, L"Could not create the U-loader window.", L"U-loader", MB_OK | MB_ICONERROR);
         return 1;
     }
@@ -4306,7 +4396,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmdline, int show)
     ListView_SetItemCountEx(g_lv, g_n, 0);
     for (int i = 0; i < g_n; i++) snap_update(g_items[i]);
     place_window(start_hidden);
-    if (mtx) ReleaseMutex(mtx);
+    if (owned) ReleaseMutex(mtx);
 
     ACCEL acc[] = {
         { FCONTROL | FVIRTKEY, 'N', IDM_ADD },
@@ -4316,9 +4406,12 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmdline, int show)
     };
     g_accel = CreateAcceleratorTableW(acc, (int)(sizeof acc / sizeof *acc));
 
-    if (job && !accept_job(job))
+    if (job && !accept_job(job)) {
+        modal_begin();
         MessageBoxW(g_hwnd, L"The download request could not be read (the job file is missing or invalid).",
                     L"U-loader", MB_OK | MB_ICONWARNING);
+        modal_end();
+    }
     if (nlinks) add_plain_links(links, nlinks);
     free_strv(links, nlinks);
     free(job);
@@ -4333,6 +4426,8 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmdline, int show)
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
-    /* download threads that did not stop in time end with the process */
+    /* download threads that did not stop in time end with the process;
+       a torrent's "stopped" to its trackers gets a moment to go out */
+    torrent_flush_announces(2000);
     return 0;
 }

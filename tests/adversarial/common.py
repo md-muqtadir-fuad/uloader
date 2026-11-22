@@ -16,6 +16,17 @@ EXE = os.environ.get("ULOADER_EXE", os.path.join(SNAP, "uloader.exe"))
 RUNS = os.path.join(ADV, "runs")
 
 
+def ulvid(urls, ext="mp4", vext=None, aext=None, headers=None, aheaders=None, title="video", vid="id"):
+    """One line of U-loader's yt-dlp --print template (ULVID2): tab-separated
+    JSON values; a missing value is NA, as yt-dlp prints it."""
+    import json
+
+    def j(v):
+        return "NA" if v is None else json.dumps(v)
+    return "\t".join(["ULVID2", j(ext), j(vext), j(aext), j(headers if headers is not None else {}),
+                      j(aheaders), j(title), j(vid), j("\n".join(urls))]) + "\n"
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))

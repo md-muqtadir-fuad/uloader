@@ -44,7 +44,7 @@ static void parse_headers_json(const char *js, ul_headers *h)
             if (k.s && v.s) headers_set(h, k.s, v.s);
         } else {
             const char *e = json_skip(p);
-            if (!e) { sb_free(&k); return; }
+            if (!e) { sb_free(&k); sb_free(&v); return; }   /* v may hold a half-parsed string */
             p = e;
         }
         sb_free(&k);
@@ -58,10 +58,66 @@ static void parse_headers_json(const char *js, ul_headers *h)
 /* ------------------------------------------------------------------ */
 typedef struct {
     char      *ext, *vext, *aext, *title;
-    ul_headers hd;
+    ul_headers hd;          /* headers yt-dlp says the (video) link needs */
+    ul_headers ahd;         /* ... and the separate audio link */
     char      *urls[4];
     int        nurls;
 } yt_item;
+
+/* headers that carry a login: yt-dlp's --add-header sends a header to
+   every site it contacts, so these never go that way */
+static int is_secret_header(const char *h)
+{
+    size_t n = strcspn(h, ":");
+    while (n && (h[n - 1] == ' ' || h[n - 1] == '\t')) n--;
+    return (n == 6 && !_strnicmp(h, "Cookie", 6)) || (n == 13 && !_strnicmp(h, "Authorization", 13)) ||
+           (n == 19 && !_strnicmp(h, "Proxy-Authorization", 19));
+}
+
+/* The -b cookie belongs to one host (cfg->cookie_host). For yt-dlp it goes
+   into a cookies.txt scoped to that host - together with the -c cookie
+   file, if any (yt-dlp takes one). NULL = nothing to add. */
+static char *scoped_cookie_jar(const ul_config *cfg)
+{
+    if (!cfg->cookie || !*cfg->cookie || !cfg->cookie_host || !*cfg->cookie_host ||
+        strpbrk(cfg->cookie_host, " \t\r\n/"))
+        return NULL;
+    wchar_t tdir[MAX_PATH + 1], tfile[MAX_PATH + 1];
+    if (!GetTempPathW(MAX_PATH + 1, tdir) || !GetTempFileNameW(tdir, L"ulc", 0, tfile)) return NULL;
+    char *path = w_to_u8(tfile);
+    FILE *f = fopen_u8(path, "wb");
+    if (!f) { file_delete(path); free(path); return NULL; }
+    fputs("# Netscape HTTP Cookie File\n", f);
+    if (cfg->cookie_file) {
+        size_t len;
+        char *old = read_file(cfg->cookie_file, &len);
+        if (old) {
+            for (char *l = old; *l;) {
+                size_t ll = strcspn(l, "\n");
+                if (strncmp(l, "# Netscape", 10) != 0) fprintf(f, "%.*s\n", (int)ll, l);
+                l += ll;
+                if (*l) l++;
+            }
+            free(old);
+        }
+    }
+    const char *host = cfg->cookie_host[0] == '.' ? cfg->cookie_host + 1 : cfg->cookie_host;
+    for (const char *p = cfg->cookie; *p;) {
+        size_t n = strcspn(p, ";");
+        char *pair = str_trim(xstrndup(p, n));
+        char *eq = strchr(pair, '=');
+        if (eq && eq != pair && !strpbrk(pair, "\t\r\n")) {
+            *eq = 0;
+            fprintf(f, ".%s\tTRUE\t/\tFALSE\t0\t%s\t%s\n", host, str_trim(pair), eq + 1);
+        }
+        free(pair);
+        p += n;
+        if (*p) p++;
+    }
+    int ok = fclose(f) == 0;
+    if (!ok) { file_delete(path); free(path); return NULL; }
+    return path;
+}
 
 static char *ytdlp_format(const ul_config *cfg, int have_ffmpeg)
 {
@@ -80,7 +136,8 @@ static char *ytdlp_format(const ul_config *cfg, int have_ffmpeg)
 /* last resort when yt-dlp says the requested format is not available */
 #define YTDLP_ANY_FORMAT "bv*+ba/b/bv*/ba*"
 
-static char *ytdlp_command(const char *exe, const ul_config *cfg, const char *url, const char *fmt)
+static char *ytdlp_command(const char *exe, const ul_config *cfg, const char *url, const char *fmt,
+                           const char *jar)
 {
     sbuf cmd = { 0 };
     cmd_append_arg(&cmd, exe);
@@ -100,24 +157,26 @@ static char *ytdlp_command(const char *exe, const ul_config *cfg, const char *ur
         free(deno);
     }
     if (cfg->referer) { cmd_append_arg(&cmd, "--referer"); cmd_append_arg(&cmd, cfg->referer); }
-    if (cfg->cookie_file) { cmd_append_arg(&cmd, "--cookies"); cmd_append_arg(&cmd, cfg->cookie_file); }
-    if (cfg->cookie) {
-        char *hc = xasprintf("Cookie:%s", cfg->cookie);
-        cmd_append_arg(&cmd, "--add-header");
-        cmd_append_arg(&cmd, hc);
-        free(hc);
-    }
+    /* cookies only through a cookies.txt (scoped per site); never as an
+       --add-header, which yt-dlp would send to every host */
+    const char *cookies = jar ? jar : cfg->cookie_file;
+    if (cookies) { cmd_append_arg(&cmd, "--cookies"); cmd_append_arg(&cmd, cookies); }
     for (int i = 0; i < cfg->nheaders; i++) {
+        if (is_secret_header(cfg->headers[i])) continue;
         cmd_append_arg(&cmd, "--add-header");
         cmd_append_arg(&cmd, cfg->headers[i]);
     }
     if (cfg->user_agent) { cmd_append_arg(&cmd, "--user-agent"); cmd_append_arg(&cmd, cfg->user_agent); }
     if (cfg->proxy) { cmd_append_arg(&cmd, "--proxy"); cmd_append_arg(&cmd, cfg->proxy); }
+    /* One line per video, every value JSON-encoded: a title with line
+       breaks (or anything yt-dlp writes to stderr) can never pose as a
+       media link. Fields: ext, video ext, audio ext, video headers, audio
+       headers, title, id, links ("\n"-separated). */
     cmd_append_arg(&cmd, "--print");
-    cmd_append_arg(&cmd, "ULVID\t%(ext)s\t%(requested_formats.0.ext|)s\t%(requested_formats.1.ext|)s\t"
-                         "%(requested_formats.0.http_headers,http_headers)j\t%(title)s [%(id)s]");
-    cmd_append_arg(&cmd, "--print");
-    cmd_append_arg(&cmd, "urls");
+    cmd_append_arg(&cmd, "ULVID2\t%(ext)j\t%(requested_formats.0.ext)j\t%(requested_formats.1.ext)j\t"
+                         "%(requested_formats.0.http_headers,http_headers)j\t%(requested_formats.1.http_headers)j\t"
+                         "%(title)j\t%(id)j\t%(urls)j");
+    /* --ytdlp-args: the user's own extra command line, spliced as typed */
     if (cfg->ytdlp_args) { sb_putc(&cmd, ' '); sb_puts(&cmd, cfg->ytdlp_args); }
     cmd_append_arg(&cmd, "--");
     cmd_append_arg(&cmd, url);
@@ -158,6 +217,7 @@ static void diag_line(yt_diag *d, const char *line)
 static void diag_report(ul_task *t, const yt_diag *d, int code)
 {
     if (d->error[0]) tlog(t, LOG_ERR, "yt-dlp: %s", d->error);
+    else if (code == RUN_FAILED) tlog(t, LOG_ERR, "yt-dlp could not be started.");
     else if (code != 0) tlog(t, LOG_ERR, "yt-dlp could not get this video (exit code %d).", code);
     else tlog(t, LOG_ERR, "no downloadable video found on this page.");
     for (int i = 0; i < d->nwarn; i++) tlog(t, LOG_DIM, "  yt-dlp warning: %s", d->warn[i]);
@@ -185,6 +245,66 @@ static char *safe_ext(const char *e, const char *fallback)
     return xstrdup(e);
 }
 
+/* A JSON string value from the ULVID2 line; NULL when missing ("NA",
+   null, or not a string) */
+static char *json_value_str(const char *v)
+{
+    const char *p = json_skip_ws(v);
+    if (*p != '"') return NULL;
+    sbuf b = { 0 };
+    if (!json_parse_string(&p, &b)) { sb_free(&b); return NULL; }
+    return sb_steal(&b);
+}
+
+/* "ULVID2\t<8 tab-separated JSON values>" -> one item. 0 if malformed. */
+static int parse_ulvid(char *line, yt_item *it)
+{
+    char *f[8];
+    char *p = line + 7;
+    int k = 0;
+    while (k < 8) {
+        f[k++] = p;
+        char *tab = strchr(p, '\t');
+        if (!tab) break;
+        *tab = 0;
+        p = tab + 1;
+    }
+    if (k < 8) return 0;
+    memset(it, 0, sizeof *it);
+    char *e0 = json_value_str(f[0]), *e1 = json_value_str(f[1]), *e2 = json_value_str(f[2]);
+    it->ext = safe_ext(e0 ? e0 : "", "mp4");
+    it->vext = safe_ext(e1 ? e1 : "", "mp4");
+    it->aext = safe_ext(e2 ? e2 : "", "m4a");
+    free(e0); free(e1); free(e2);
+    parse_headers_json(f[3], &it->hd);
+    parse_headers_json(f[4], &it->ahd);
+
+    char *title = json_value_str(f[5]), *id = json_value_str(f[6]);
+    if (title) for (char *c = title; *c; c++) if (*c == '\r' || *c == '\n' || *c == '\t') *c = ' ';
+    if (title) str_trim(title);
+    int id_ok = id && *id && strlen(id) <= 64 && !strpbrk(id, "\r\n\t");
+    if (title && *title && id_ok) it->title = xasprintf("%s [%s]", title, id);
+    else if (title && *title) it->title = xstrdup(title);
+    else it->title = xstrdup(id_ok ? id : "video");
+    free(title);
+    free(id);
+
+    char *urls = json_value_str(f[7]);
+    for (char *u = urls; u && *u && it->nurls < 4;) {
+        size_t n = strcspn(u, "\n");
+        char *one = xstrndup(u, n);
+        str_trim(one);
+        if ((str_istarts(one, "http://") || str_istarts(one, "https://")) && !strpbrk(one, " \t\r\"<>"))
+            it->urls[it->nurls++] = one;                  /* real links have no spaces */
+        else
+            free(one);
+        u += n;
+        if (*u) u++;
+    }
+    free(urls);
+    return 1;
+}
+
 int ytdlp_run(http_session *s, ul_config *cfg, const char *url)
 {
     ul_task *t = http_task(s);
@@ -201,6 +321,13 @@ int ytdlp_run(http_session *s, ul_config *cfg, const char *url)
     task_set_stage(t, "%s", "finding video");
     task_progress(t);
 
+    for (int i = 0; i < cfg->nheaders; i++)
+        if (is_secret_header(cfg->headers[i])) {
+            tlog(t, LOG_DIM, "  (login headers from -H are not passed to yt-dlp: it would send them to every site it contacts)");
+            break;
+        }
+    char *jar = scoped_cookie_jar(cfg);
+
     yt_item *items = NULL;
     int n = 0, cap = 0, code = 0;
     yt_diag diag;
@@ -214,48 +341,28 @@ int ytdlp_run(http_session *s, ul_config *cfg, const char *url)
             fmt = xstrdup(YTDLP_ANY_FORMAT);
         }
         memset(&diag, 0, sizeof diag);
-        char *cmd = ytdlp_command(exe, cfg, url, fmt);
+        char *cmd = ytdlp_command(exe, cfg, url, fmt, jar);
         char *outp = NULL;
         code = run_process(cmd, &outp, t);
         free(cmd);
 
-        /* parse "ULVID\t..." blocks followed by their URL lines */
+        /* one "ULVID2\t..." line per video; everything else is a message */
         char *cur = outp, *line;
         while (cur && *cur) {
             char *nl = strchr(cur, '\n');
             if (nl) *nl = 0;
             line = str_trim(cur);
             cur = nl ? nl + 1 : cur + strlen(cur);
-            if (strncmp(line, "ULVID\t", 6) == 0) {
-                char *f[5];
-                char *p = line + 6;
-                int k = 0;
-                for (; k < 4; k++) {
-                    char *tab = strchr(p, '\t');
-                    if (!tab) break;
-                    *tab = 0;
-                    f[k] = p;
-                    p = tab + 1;
-                }
-                if (k < 4) continue;
-                f[4] = p;
+            if (strncmp(line, "ULVID2\t", 7) == 0) {
                 if (n == cap) { cap = cap ? cap * 2 : 4; items = xrealloc(items, sizeof *items * (size_t)cap); }
-                yt_item *it = &items[n++];
-                memset(it, 0, sizeof *it);
-                it->ext = safe_ext(f[0], "mp4");
-                it->vext = safe_ext(f[1], "mp4");
-                it->aext = safe_ext(f[2], "m4a");
-                parse_headers_json(f[3], &it->hd);
-                it->title = xstrdup(*f[4] ? f[4] : "video");
-            } else if (n > 0 && (str_istarts(line, "http://") || str_istarts(line, "https://")) &&
-                       !strpbrk(line, " \t\"<>") && items[n - 1].nurls < 4) {   /* real URLs have no spaces */
-                items[n - 1].urls[items[n - 1].nurls++] = xstrdup(line);
+                if (parse_ulvid(line, &items[n])) n++;
             } else {
                 diag_line(&diag, line);
             }
         }
         free(outp);
     }
+    if (jar) { file_delete(jar); free(jar); }
     free(fmt);
     free(exe);
     task_set_stage(t, "%s", "");
@@ -308,7 +415,7 @@ int ytdlp_run(http_session *s, ul_config *cfg, const char *url)
             rc = download_url(s, cfg, it->urls[0], vpath, &it->hd, chunk, 0);
             if (rc == 0) {
                 task_set_stage(t, "%s", "audio stream");
-                rc = download_url(s, cfg, it->urls[1], apath, &it->hd, chunk, 0);
+                rc = download_url(s, cfg, it->urls[1], apath, it->ahd.n ? &it->ahd : &it->hd, chunk, 0);
             }
             if (rc == 0) {
                 if (ffmpeg) {
@@ -343,6 +450,7 @@ int ytdlp_run(http_session *s, ul_config *cfg, const char *url)
     for (int i = 0; i < n; i++) {
         free(items[i].ext); free(items[i].vext); free(items[i].aext); free(items[i].title);
         headers_free(&items[i].hd);
+        headers_free(&items[i].ahd);
         for (int k = 0; k < items[i].nurls; k++) free(items[i].urls[k]);
     }
     free(items);
@@ -371,6 +479,7 @@ int ytdlp_install(http_session *s, ul_config *cfg)
         }
         free(out);
         free(existing);
+        if (r == RUN_FAILED && task_aborted(t)) return 2;   /* stopped, not failed */
         return r == 0 ? 0 : 1;
     }
     char *dir = exe_dir();

@@ -18,6 +18,15 @@ import sys
 import tempfile
 import time
 import traceback
+import urllib.parse
+
+# a failure report may quote U-loader's progress bar: never crash on a
+# console code page that cannot print it
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -39,6 +48,13 @@ ENV = dict(os.environ)
 # keep the real yt-dlp / ffmpeg out of the way so results are predictable
 ENV["PATH"] = os.pathsep.join(p for p in ENV.get("PATH", "").split(os.pathsep)
                               if not os.path.isfile(os.path.join(p, "yt-dlp.exe")))
+# ... including the tools U-loader finds next to itself (the repo folder keeps
+# a yt-dlp.exe): the tests run a private copy of the exe
+_bin = os.path.join(WORK, "bin")
+os.makedirs(_bin)
+shutil.copy2(EXE, os.path.join(_bin, "uloader.exe"))
+EXE_UNDER_TEST = EXE
+EXE = os.path.join(_bin, "uloader.exe")
 
 
 def free_port():
@@ -380,6 +396,51 @@ def already_downloaded_is_skipped():
 
 
 @test
+def file_is_dated_when_downloaded():
+    """The server says 2019; the saved file must carry today's date (created and modified)."""
+    d = outdir("dated")
+    t0 = time.time()
+    rc, out, _ = run(["-d", d, BASE + "/old/three.bin"])
+    check(rc == 0, "exit %d\n%s" % (rc, out))
+    p = os.path.join(d, "three.bin")
+    st = os.stat(p)
+    check(abs(st.st_mtime - t0) < 120, "modified date is %s, not now" % time.ctime(st.st_mtime))
+    check(abs(st.st_ctime - t0) < 120, "created date is %s, not now" % time.ctime(st.st_ctime))
+
+
+@test
+def already_downloaded_checks_the_version():
+    """Re-run = skipped; a same-sized but different file on the server = downloaded again."""
+    d = outdir("version")
+    src = make("version.bin", 300000, seed=11)
+    rc, out, _ = run(["-d", d, BASE + "/r/version.bin"])
+    check(rc == 0, "first download: exit %d\n%s" % (rc, out))
+    rc, out, _ = run(["-d", d, BASE + "/r/version.bin"])
+    check(rc == 0 and "Already downloaded" in out, "re-run should be skipped:\n" + out)
+    time.sleep(1.1)                                  # new mtime -> new ETag
+    with open(src, "r+b") as f:
+        f.write(os.urandom(1000))
+    rc, out, _ = run(["-d", d, BASE + "/r/version.bin"])
+    check(rc == 0 and "Already downloaded" not in out, "changed file must be downloaded again:\n" + out)
+    same(os.path.join(d, "version (1).bin"), src)
+
+
+@test
+def http_trace_hides_secrets():
+    """ULOADER_HTTP_TRACE logs the exchange but never cookie/authorization values."""
+    d = outdir("trace")
+    log = os.path.join(WORK, "http-trace.txt")
+    env = dict(ENV, ULOADER_HTTP_TRACE=log)
+    p = subprocess.run([EXE, "-d", d, "-b", "sid=TOPSECRET", "-H", "Authorization: Bearer ALSOSECRET",
+                        BASE + "/r/three.bin"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=60)
+    check(p.returncode == 0, "exit %d" % p.returncode)
+    text = open(log, encoding="utf-8").read()
+    check("GET /r/three.bin" in text and "< HTTP/1." in text, "trace incomplete:\n" + text[:500])
+    check("Cookie: <" in text and "Authorization: <" in text, "secret headers not listed:\n" + text[:800])
+    check("TOPSECRET" not in text and "ALSOSECRET" not in text, "a secret value leaked into the trace")
+
+
+@test
 def long_and_unicode_paths():
     d = os.path.join(outdir("long"), *(["very long folder name ঝ"] * 12))
     check(len(d) > 260, "path not long enough for the test")
@@ -419,6 +480,115 @@ def hls_aes128():
     rc, out, _ = run(["-d", d, BASE + "/r/aes.m3u8"])
     check(rc == 0, "exit %d\n%s" % (rc, out))
     same(os.path.join(d, "aes.ts"), expected)
+
+
+@test
+def hls_names_and_cleanup():
+    """'clip.mp4.m3u8' is saved as 'clip.ts' (not 'clip.mp4.ts'), no cache folder is left
+    behind, and the same link again never overwrites the first file."""
+    lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:4"]
+    plain = b""
+    for i in range(4):
+        data = os.urandom(40000 + i * 333)
+        plain += data
+        with open(os.path.join(FIX, "cseg%d.ts" % i), "wb") as f:
+            f.write(data)
+        lines += ["#EXTINF:4.0,", "cseg%d.ts" % i]
+    lines.append("#EXT-X-ENDLIST")
+    with open(os.path.join(FIX, "clip.mp4.m3u8"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    expected = os.path.join(WORK, "clip-expected.bin")
+    with open(expected, "wb") as f:
+        f.write(plain)
+    d = outdir("hlsnames")
+    rc, out, _ = run(["-d", d, BASE + "/r/clip.mp4.m3u8"])
+    check(rc == 0, "exit %d\n%s" % (rc, out))
+    same(os.path.join(d, "clip.ts"), expected)
+    check(not os.path.exists(os.path.join(d, "clip.ulhls")),
+          "the segment cache folder was left behind: %s" % os.listdir(d))
+    first = sha(os.path.join(d, "clip.ts"))
+    with open(os.path.join(FIX, "cseg0.ts"), "wb") as f:      # the stream changed meanwhile
+        f.write(os.urandom(40000))
+    rc, out, _ = run(["-d", d, BASE + "/r/clip.mp4.m3u8"])
+    check(rc == 0, "second run: exit %d\n%s" % (rc, out))
+    check(sha(os.path.join(d, "clip.ts")) == first, "the first download was overwritten")
+    check(os.path.exists(os.path.join(d, "clip (1).ts")),
+          "the second run should be 'clip (1).ts': %s" % os.listdir(d))
+    bad = [f for f in os.listdir(d) if f.endswith(".ulhls") or ".mp4." in f]
+    check(not bad, "leftovers / double extensions: %s" % bad)
+
+
+@test
+def hls_same_name_at_the_same_time():
+    """Two different streams with the same file name downloaded at the same time (a CDN
+    that names every video '1080p.av1.mp4.m3u8'): each gets its own name and segment
+    folder - the second must not delete the first one's segments ('disk full?' at the join)."""
+    lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:4"]
+    plain = b""
+    for i in range(6):
+        data = os.urandom(40000 + i)
+        plain += data
+        with open(os.path.join(FIX, "dseg%d.ts" % i), "wb") as f:
+            f.write(data)
+        lines += ["#EXTINF:4.0,", "dseg%d.ts?kbps=100" % i]     # slow: the two runs overlap
+    lines.append("#EXT-X-ENDLIST")
+    with open(os.path.join(FIX, "dup.m3u8"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    expected = os.path.join(WORK, "dup-expected.bin")
+    with open(expected, "wb") as f:
+        f.write(plain)
+    d = outdir("hlsdup")
+    # two links -> two streams to U-loader (different playlist URLs), same name "dup"
+    a = subprocess.Popen([EXE, "-c", "1", "-d", d, BASE + "/r/dup.m3u8"], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, env=ENV)
+    time.sleep(1.0)
+    b = subprocess.Popen([EXE, "-c", "1", "-d", d, BASE + "/redir/1/dup.m3u8"], stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, env=ENV)
+    out_a = a.communicate(timeout=120)[0].decode("utf-8", "replace")
+    out_b = b.communicate(timeout=120)[0].decode("utf-8", "replace")
+    check(a.returncode == 0, "first run: exit %d\n%s" % (a.returncode, out_a))
+    check(b.returncode == 0, "second run: exit %d\n%s" % (b.returncode, out_b))
+    same(os.path.join(d, "dup.ts"), expected, "first download")
+    same(os.path.join(d, "dup (1).ts"), expected, "second download")
+    check(not [f for f in os.listdir(d) if f.endswith((".ulhls", ".ulpart"))], "leftovers: %s" % os.listdir(d))
+
+
+@test
+def hls_wrong_key_fails():
+    """A wrong AES-128 key fails the download instead of saving garbage as finished."""
+    if shutil.which("openssl") is None:
+        return "skipped (no openssl)"
+    key = bytes(range(16))
+    with open(os.path.join(FIX, "wrong.key"), "wb") as f:
+        f.write(bytes(range(16, 32)))
+    lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:4",
+             '#EXT-X-KEY:METHOD=AES-128,URI="/r/wrong.key",IV=0x00000000000000000000000000000001']
+    for i in range(3):
+        src = os.path.join(WORK, "wk%d.bin" % i)
+        with open(src, "wb") as f:
+            f.write(os.urandom(30000 + i))
+        subprocess.run(["openssl", "enc", "-aes-128-cbc", "-K", key.hex(), "-iv", "%032x" % 1,
+                        "-in", src, "-out", os.path.join(FIX, "wkseg%d.ts" % i)], check=True)
+        lines += ["#EXTINF:4.0,", "wkseg%d.ts" % i]
+    lines.append("#EXT-X-ENDLIST")
+    with open(os.path.join(FIX, "wrongkey.m3u8"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    d = outdir("hlswrongkey")
+    rc, out, _ = run(["-d", d, BASE + "/r/wrongkey.m3u8"])
+    check(rc != 0, "a wrong key must fail the download\n%s" % out)
+    check("decryption failed" in out, "no decryption error reported:\n%s" % out)
+    check(not os.path.exists(os.path.join(d, "wrongkey.ts")), "garbage was saved as the result")
+
+
+@test
+def disposition_parameter_names_are_exact():
+    """'xfilename=' and a 'filename=' inside another quoted value are not the file name."""
+    d = outdir("cdexact")
+    h = 'attachment; xfilename="evil.exe"; title="a filename=bad.exe b"; filename="good.bin"'
+    rc, out, _ = run(["-d", d, BASE + "/cdraw/three.bin?h=" + urllib.parse.quote(h)])
+    check(rc == 0, "exit %d\n%s" % (rc, out))
+    same(os.path.join(d, "good.bin"), F3)
+    check(os.listdir(d) == ["good.bin"], "unexpected files: %s" % os.listdir(d))
 
 
 @test
@@ -499,6 +669,21 @@ def credentials_not_forwarded_across_hosts():
 
 
 @test
+def site_cookie_carries_within_a_download():
+    """A cookie the server sets on a redirect is sent with every later request of that
+    download (all connections); one it deletes (Max-Age=0) is not."""
+    d = outdir("sitecookie")
+    clear_log()
+    rc, out, _ = run(["-d", d, "-c", "4", BASE + "/setcookie/three.bin"])
+    check(rc == 0, "exit %d\n%s" % (rc, out))
+    same(os.path.join(d, "three.bin"), F3)
+    gated = [r for r in requests_log() if r["path"].startswith("/needcookie/")]
+    check(len(gated) >= 2, "expected several requests to the gated file, saw %d" % len(gated))
+    check(all("ulgate=open" in (r["cookie"] or "") for r in gated), "the site cookie was not sent every time")
+    check(not any("ulgone" in (r["cookie"] or "") for r in gated), "a deleted cookie was sent")
+
+
+@test
 def empty_input_list_is_an_error():
     lst = os.path.join(WORK, "empty-list.txt")
     with open(lst, "w") as f:
@@ -529,6 +714,13 @@ def native_host_protocol():
     check(res[0].get("ok") is True and "version" in res[0], "ping failed: %s" % res)
     check(res[1].get("ok") is False and res[2].get("ok") is False, "bad requests must be refused: %s" % res)
     check(res[3].get("ok") is False, "javascript: link must be refused: %s" % res)
+    # verify: a captured browser download is only accepted when U-loader can
+    # really get the file (refusals are answered before any job is created)
+    rc, res = exchange([json.dumps({"action": "download", "url": BASE + "/status/403", "verify": True}).encode(),
+                        json.dumps({"action": "download", "url": BASE + "/page", "filename": "report.pdf",
+                                    "verify": True}).encode()])
+    check(res[0].get("ok") is False and res[0].get("status") == 403, "403 must be refused: %s" % res[0])
+    check(res[1].get("ok") is False and "web page" in res[1].get("error", ""), "a login page must be refused: %s" % res[1])
     # an oversized length prefix must not crash or hang the host
     p = subprocess.Popen([EXE, "chrome-extension://x/"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=ENV)
     p.communicate(struct.pack("<I", 0x7FFFFFFF) + b"{}", timeout=10)
@@ -537,7 +729,7 @@ def native_host_protocol():
 
 # ----------------------------------------------------------------------
 def main():
-    print("U-loader tests: %s\nwork dir: %s\n" % (EXE, WORK))
+    print("U-loader tests: %s (run as a private copy)\nwork dir: %s\n" % (EXE_UNDER_TEST, WORK))
     passed = failed = skipped = 0
     for fn in TESTS:
         if ONLY and ONLY not in fn.__name__:

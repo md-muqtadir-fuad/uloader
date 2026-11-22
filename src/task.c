@@ -48,12 +48,20 @@ static void name_reserve(char **path, int may_rename)
         free(part);
         if (!busy) break;
         char *u = unique_path(*path);
-        while (name_taken_locked(u) && strcmp(u, *path) != 0) {   /* skip names reserved here */
-            char *stem = path_strip_ext(u), *v;
-            v = xasprintf("%s_%d%s", stem, i, path_ext(u));
+        if (name_taken_locked(u)) {             /* reserved here but not on disk yet */
+            char *stem = path_strip_ext(u);
+            const char *ext = path_ext(u);
+            for (int k = 1; k < 100000; k++) {
+                char *v = xasprintf("%s_%d%s", stem, k, ext);
+                char *vp = xasprintf("%s.ulpart", v), *vs = xasprintf("%s.ulstate", v);
+                /* free here AND on disk: never take over somebody's file */
+                int unused = !name_taken_locked(v) && !file_exists(v) && !file_exists(vp) && !file_exists(vs);
+                free(vp);
+                free(vs);
+                if (unused) { free(u); u = v; break; }
+                free(v);
+            }
             free(stem);
-            free(u);
-            u = v;
         }
         free(*path);
         *path = u;
@@ -106,7 +114,8 @@ void task_free(ul_task *t)
 
 int task_aborted(const ul_task *t)
 {
-    return g_abort || (t && t->abort);
+    if (t && t->abort) return 1;
+    return g_abort && !(t && t->ignore_ctrl_c);   /* a final tracker "stopped" still goes out */
 }
 
 void task_sleep(const ul_task *t, DWORD ms)
@@ -229,12 +238,40 @@ void task_progress(ul_task *t)
 /* ------------------------------------------------------------------ */
 /* naming                                                              */
 /* ------------------------------------------------------------------ */
+/* Where the value of parameter `name` starts in a Content-Disposition
+   header. Only a real parameter counts: "xfilename=" or a "filename="
+   inside another parameter's quoted value does not. */
+static const char *cd_param(const char *cd, const char *name)
+{
+    size_t nl = strlen(name);
+    int inq = 0, at_name = 1;
+    for (const char *p = cd; *p; p++) {
+        if (inq) {
+            if (*p == '\\' && p[1]) p++;
+            else if (*p == '"') inq = 0;
+            continue;
+        }
+        if (*p == '"') { inq = 1; at_name = 0; continue; }
+        if (*p == ';') { at_name = 1; continue; }
+        if (*p == ' ' || *p == '\t') continue;
+        if (at_name && _strnicmp(p, name, nl) == 0) {
+            const char *q = p + nl;
+            while (*q == ' ' || *q == '\t') q++;
+            if (*q == '=') {
+                for (q++; *q == ' ' || *q == '\t'; q++) {}
+                return q;
+            }
+        }
+        at_name = 0;
+    }
+    return NULL;
+}
+
 static char *disposition_filename(const char *cd)
 {
     if (!cd) return NULL;
-    const char *p = str_istr(cd, "filename*=");
+    const char *p = cd_param(cd, "filename*");
     if (p) {
-        p += 10;
         while (*p == ' ' || *p == '"') p++;
         size_t n = strcspn(p, ";\"");
         const char *q = memchr(p, '\'', n);              /* charset'lang'value */
@@ -247,10 +284,8 @@ static char *disposition_filename(const char *cd)
             }
         }
     }
-    p = str_istr(cd, "filename=");
+    p = cd_param(cd, "filename");
     if (p) {
-        p += 9;
-        while (*p == ' ') p++;
         sbuf b = { 0 };
         if (*p == '"') {
             for (p++; *p && *p != '"'; p++) {
@@ -328,14 +363,45 @@ static char *find_renamed_resume(const char *path, const char *url)
     return found;
 }
 
-/* Same size is not enough to call a file "already downloaded": when the
-   server tells us the date, the file must carry that date too (completed
-   downloads are stamped with it). No date from the server = cannot tell. */
-static int same_date(const char *path, const char *last_modified)
+/* Same size is not enough to call a file "already downloaded". A finished
+   download remembers the server's ETag / Last-Modified (file_meta_write),
+   and those decide. Without that record (a file from elsewhere, an older
+   U-loader, a drive without NTFS streams) the first and last bytes are
+   compared with the server. *probe_used is set once the probe response
+   was read from: it can then no longer be streamed into the file. */
+static int is_same_file(http_session *s, const char *url, const ul_headers *hd, http_response *probe,
+                        const char *path, int64_t total, int *probe_used)
 {
-    FILETIME ft;
-    if (!http_date_to_filetime(last_modified, &ft)) return 1;
-    return file_mtime_equals(path, &ft) != 0;
+    int m = file_meta_matches(path, probe->etag, probe->last_modified);
+    if (m >= 0) return m;
+    if (total == 0) return 1;
+    enum { N = 65536 };
+    FILE *f = fopen_u8(path, "rb");
+    if (!f) return 0;
+    char *a = xmalloc(N), *b = xmalloc(N);
+    size_t n = total < N ? (size_t)total : N, got = 0;
+    *probe_used = 1;
+    while (got < n) {
+        DWORD k = 0;
+        if (http_read(probe, b + got, (DWORD)(n - got), &k) != 0 || k == 0) break;
+        got += k;
+    }
+    int same = got == n && fread(a, 1, n, f) == n && memcmp(a, b, n) == 0;
+    if (same && probe->status == 206 && total > (int64_t)n) {
+        int64_t from = total - N > (int64_t)n ? total - N : (int64_t)n;
+        size_t want = (size_t)(total - from), rg = 0;
+        char err[256];
+        char *tail = http_get_body(s, url, hd, from, total - 1, 0, &rg, NULL, 1, err, sizeof err, NULL);
+        if (tail) {                                   /* no answer: the start matched, keep it */
+            same = rg == want && _fseeki64(f, from, SEEK_SET) == 0 && fread(a, 1, want, f) == want &&
+                   memcmp(a, tail, want) == 0;
+            free(tail);
+        }
+    }
+    free(a);
+    free(b);
+    fclose(f);
+    return same;
 }
 
 static int is_hls_url(const char *url)
@@ -364,7 +430,10 @@ int download_url(http_session *s, ul_config *cfg, const char *url, const char *f
     err[0] = 0;
     int is_ftp = str_istarts(url, "ftp://");
     for (int attempt = 0; attempt <= 3 && !task_aborted(t); attempt++) {
-        if (attempt) task_sleep(t, 1000u * (DWORD)attempt);
+        if (attempt) {
+            task_sleep(t, 1000u * (DWORD)attempt);
+            if (task_aborted(t)) break;            /* paused while waiting: no new request */
+        }
         int rq = http_request(s, url, hd, 0, -1, 0, &probe, err, sizeof err);
         if (rq == -2) break;                       /* permanent: do not retry */
         if (rq != 0) continue;
@@ -446,22 +515,34 @@ int download_url(http_session *s, ul_config *cfg, const char *url, const char *f
 
     char *state = xasprintf("%s.ulstate", path);
     int resuming = file_exists(state);
+    int probe_used = 0;                      /* read from by is_same_file */
     free(state);
     if (!resuming && file_exists(path)) {
         int64_t total = probe.status == 206 ? probe.range_total : probe.content_length;
-        if (dir_exists(path)) {
+        if (dir_exists(path) && forced_path) {
+            tlog(t, LOG_ERR, "a folder is in the way: %s", path);
+            http_close(&probe);
+            free(path);
+            return 1;
+        } else if (dir_exists(path)) {
             char *u = unique_path(path);
             free(path);
             path = u;
         } else if (cfg->overwrite) {
             /* replaced when the download completes */
-        } else if (total >= 0 && file_size(path) == total && same_date(path, probe.last_modified)) {
+        } else if (total >= 0 && file_size(path) == total &&
+                   is_same_file(s, url, hd, &probe, path, total, &probe_used)) {
             tlog(t, LOG_OK, "Already downloaded: %s", path);
             task_set_file(t, path_basename(path), path);
             t->done = t->total = total;
             http_close(&probe);
             free(path);
             return 0;
+        } else if (forced_path) {
+            /* The caller (a stream to merge, ...) uses exactly this name: an
+               old leftover there is replaced when the download completes,
+               never dodged with "name (1)" - that left the caller merging
+               the stale file. */
         } else {
             char *u = find_renamed_resume(path, url);
             if (!u) u = unique_path(path);
@@ -477,7 +558,8 @@ int download_url(http_session *s, ul_config *cfg, const char *url, const char *f
     job.headers = hd;
     job.connections = cfg->connections;
     job.chunk_size = chunk;
-    int rc = dl_run(s, cfg, &job, &probe);   /* takes ownership of probe */
+    if (probe_used) http_close(&probe);      /* partly read: the engine asks again */
+    int rc = dl_run(s, cfg, &job, probe_used ? NULL : &probe);   /* takes ownership of probe */
     name_release(path);
     free(path);
     return rc;
@@ -505,8 +587,11 @@ static unsigned __stdcall watch_abort(void *arg)
 /* ------------------------------------------------------------------ */
 int task_run(ul_task *t, ul_config *cfg)
 {
-    int resuming = t->state == TS_PAUSED;
-    t->abort = 0;
+    /* The caller clears t->abort before it starts this thread. Clearing it
+       here again would lose a Pause / Delete / Exit clicked in between.
+       The GUI already marks the task "running", so earlier progress - not
+       the state - tells that this is a resume. */
+    int resuming = t->state == TS_PAUSED || t->done > 0;
     t->state = TS_RUNNING;
     if (resuming) {           /* keep showing the old progress until the engine reports */
         t->speed = 0;
@@ -575,7 +660,9 @@ int task_run(ul_task *t, ul_config *cfg)
         snprintf(t->status, sizeof t->status, "Paused");
         LeaveCriticalSection(&t->lock);
     }
-    task_progress(t);
+    /* the final state for the window; the console has already printed its
+       last line (a progress bar after "failed" / "Saved to" is noise) */
+    if (t->on_progress) task_progress(t);
     return rc;
 }
 
@@ -663,7 +750,7 @@ char *job_write(const char *url, const char *mode, const char *referer, const ch
     if (!GetTempPathW(MAX_PATH + 1, tdir) || !GetTempFileNameW(tdir, L"ulj", 0, tfile)) return NULL;
     char *path = w_to_u8(tfile);
     FILE *f = fopen_u8(path, "wb");
-    if (!f) { free(path); return NULL; }
+    if (!f) { file_delete(path); free(path); return NULL; }   /* GetTempFileName created it */
     fprintf(f, "U-LOADER-JOB 1\n");
     job_line(f, "url", url);
     job_line(f, "mode", mode);
@@ -674,6 +761,7 @@ char *job_write(const char *url, const char *mode, const char *referer, const ch
     if (connections > 0) fprintf(f, "connections=%d\n", connections);
     if (quality > 0) fprintf(f, "quality=%d\n", quality);
     job_line(f, "cookies", cookie_file);
-    if (fclose(f) != 0) { file_delete(path); free(path); return NULL; }
+    int wok = !ferror(f);
+    if (fclose(f) != 0 || !wok) { file_delete(path); free(path); return NULL; }
     return path;
 }

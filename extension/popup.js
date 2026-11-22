@@ -73,9 +73,11 @@ async function showMedia() {
   const list = $("media");
   list.textContent = "";
   if (!tab) return;
-  const items = await ask({ type: "media", tabId: tab.id });
-  $("mediaEmpty").hidden = Array.isArray(items) && items.length > 0;
-  for (const it of items || []) {
+  const reply = await ask({ type: "media", tabId: tab.id });
+  // an error reply ({ ok: false, ... }) is not a list
+  const items = Array.isArray(reply) ? reply : [];
+  $("mediaEmpty").hidden = items.length > 0;
+  for (const it of items) {
     const li = document.createElement("li");
     const info = document.createElement("div");
     info.className = "info";
@@ -138,6 +140,15 @@ document.addEventListener("DOMContentLoaded", async () => {
   });
 
   for (const id of ["tagger", "capture", "exts", "connections", "quality"]) $(id).addEventListener("change", saveSettings);
+  // the popup closes without a "change" (blur) on the text box: save while typing
+  let extsTimer = 0;
+  $("exts").addEventListener("input", () => {
+    clearTimeout(extsTimer);
+    extsTimer = setTimeout(saveSettings, 300);
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") { clearTimeout(extsTimer); saveSettings(); }
+  });
 
   await loadSettings();
   checkConnection();
