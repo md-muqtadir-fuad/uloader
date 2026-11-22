@@ -1,0 +1,14 @@
+# One line-ending rule for everyone (no LF/CRLF warnings, no mixed files):
+# text is stored with LF; Windows batch and Inno Setup files are checked
+# out with CRLF, which cmd.exe and the Inno compiler expect.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.iss text eol=crlf
+
+*.exe binary
+*.dll binary
+*.ico binary
+*.png binary
+*.jpg binary
+*.res binary
