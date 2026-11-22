@@ -31,9 +31,13 @@ stream copy needs, under the LGPL; the full builds are over 200 MB.
    video, uninstall.
 5. Publish a GitHub release named `v<version>` with the setup attached as
    `U-loader-Setup-<version>.exe` - installed copies find it there and offer
-   the update (see below). Link the FFmpeg source tarball named in
-   `build-ffmpeg.sh` in the release notes, as
-   [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) promises (LGPL).
+   the update (see below). Also attach the FFmpeg source tarball named in
+   `build-ffmpeg.sh` (and its `.asc`) and link it in the release notes, as
+   [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) promises (LGPL;
+   FFmpeg asks for the source next to the binary).
+6. Point the download links at the new setup: the button and version line in
+   `docs/index.html` (and its `downloadUrl`), and the Install section of
+   `README.md`.
 
 ## Updates
 

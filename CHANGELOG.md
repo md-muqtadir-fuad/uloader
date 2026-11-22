@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.3.0 (not released yet)
+## 1.3.0 (2026-11-22)
 
 ### New
 - **Categories** ([#1](https://github.com/md-muqtadir-fuad/uloader/issues/1)): downloads are sorted into
@@ -21,6 +21,9 @@
   `--check-update` on the command line.
 - **Only real qualities** ([#9](https://github.com/md-muqtadir-fuad/uloader/issues/9)): the video
   button and the popup offer only the heights the video really has.
+- **Add to browser** ([#13](https://github.com/md-muqtadir-fuad/uloader/issues/13)): on first start
+  U-loader shows how to add its browser extension (it copies the extensions page address and the
+  folder) and notices when the extension connects.
 - **Smaller setup** ([#12](https://github.com/md-muqtadir-fuad/uloader/issues/12)): a 3 MB FFmpeg
   built for U-loader's stream copy instead of the 217 MB full build, now under the LGPL.
 - The browser keeps a download that U-loader cannot get (for example when the site answers

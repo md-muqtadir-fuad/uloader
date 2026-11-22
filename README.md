@@ -24,8 +24,8 @@
 
 ## Install
 
-Download `U-loader-Setup-<version>.exe` from
-[Releases](https://github.com/md-muqtadir-fuad/uloader/releases) and run it.
+Download **[U-loader-Setup-1.3.0.exe](https://github.com/md-muqtadir-fuad/uloader/releases/download/v1.3.0/U-loader-Setup-1.3.0.exe)**
+(53 MB) and run it. Older versions are on the [Releases](https://github.com/md-muqtadir-fuad/uloader/releases) page.
 It installs for your account only and can include yt-dlp, FFmpeg and Deno.
 
 Windows may say *"Windows protected your PC"* for a new program: choose
