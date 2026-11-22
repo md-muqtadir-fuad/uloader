@@ -75,7 +75,7 @@ def main():
         os.makedirs(d)
     # settings: save into OUT by default (so forwarded links do not land in the real Downloads folder)
     with open(os.path.join(DATA, "settings.txt"), "w", encoding="utf-8") as f:
-        f.write("dir=%s\n" % OUT)
+        f.write("dir=%s\nupdates=0\nbrowser_guide=0\n" % OUT)   # no update check (GitHub, yt-dlp -U) in tests
 
     port = U.free_port()
     srvlog = os.path.join(T, "server.log")
@@ -229,10 +229,13 @@ def main():
         sd = U.find_dialog(p.pid, "Settings", 5)
         time.sleep(0.5)
         U.capture(sd, os.path.join(SHOTS, "settings_dialog.png"))
-        U.user32.PostMessageW(sd, U.WM_COMMAND, 1110, 0)      # Connect to browsers (no uloader.exe here)
-        time.sleep(1.5)
-        out = U.dlg_text(sd, 1115)
-        ok("connect-to-browsers runs off the UI thread and reports", "uloader.exe" in out, out.strip()[:90])
+        U.user32.PostMessageW(sd, U.WM_COMMAND, 1110, 0)      # "Add to browser..." (no uloader.exe here)
+        guide = U.find_dialog(p.pid, "Add U-loader to your browser", 5)
+        ok("Add to browser opens the step-by-step window", guide)
+        ok("UI stays responsive meanwhile", U.ping(main) is not None)
+        if guide:
+            U.user32.PostMessageW(guide, U.WM_COMMAND, U.IDCANCEL, 0)
+            U.wait_for(lambda: not U.user32.IsWindow(guide), 5, what="guide closed")
         U.capture(sd, os.path.join(SHOTS, "settings_dialog_output.png"))
         U.user32.PostMessageW(sd, U.WM_COMMAND, U.IDCANCEL, 0)
         U.wait_for(lambda: not U.dialogs(p.pid), 5, what="settings closed")

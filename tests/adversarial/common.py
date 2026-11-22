@@ -14,6 +14,9 @@ SCRATCH = os.path.dirname(ADV)
 SNAP = os.path.join(SCRATCH, "review-v1")
 EXE = os.environ.get("ULOADER_EXE", os.path.join(SNAP, "uloader.exe"))
 RUNS = os.path.join(ADV, "runs")
+# every U-loader these tests start (also the native host) keeps its data here,
+# never in the real %APPDATA%\U-loader
+os.environ.setdefault("ULOADER_DATA", os.path.join(RUNS, "_data"))
 
 
 def ulvid(urls, ext="mp4", vext=None, aext=None, headers=None, aheaders=None, title="video", vid="id"):

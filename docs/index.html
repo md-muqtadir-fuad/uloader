@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>U-loader - download manager for Windows</title>
+<meta name="description" content="A fast multi-connection download manager for Windows, with a browser extension and video-site support.">
+<link rel="icon" href="icon.png">
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1b1f24; --muted: #57606a; --line: #d8dee4;
+    --card: #f6f8fa; --accent: #2563eb; --accent-fg: #ffffff; --mark: #e11d48;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0; --line: #30363d; --card: #161b22; --accent: #3b82f6; }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.6 "Segoe UI", system-ui, -apple-system, sans-serif; }
+  main { max-width: 820px; margin: 0 auto; padding: 0 16px 48px; }
+  header { text-align: center; padding: 48px 0 16px; }
+  header img { width: 88px; height: 88px; }
+  h1 { font-size: 40px; margin: 12px 0 4px; }
+  .tagline { color: var(--muted); font-size: 18px; margin: 0 0 24px; }
+  .buttons { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .btn { display: inline-block; text-decoration: none; font-weight: 600; padding: 12px 28px; border-radius: 8px;
+         border: 2px solid var(--accent); }
+  .btn.primary { background: var(--accent); color: var(--accent-fg); }
+  .btn:hover { filter: brightness(1.08); }
+  .small { color: var(--muted); font-size: 14px; margin-top: 10px; }
+  .byline { margin: 4px 0 0; }
+  h2 { font-size: 24px; margin: 48px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+  h3 { font-size: 18px; margin: 28px 0 8px; }
+  ul, ol { padding-left: 22px; }
+  li { margin: 4px 0; }
+  code { background: var(--card); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px;
+         font: 14px Consolas, "Cascadia Mono", monospace; word-break: break-all; }
+  a { color: var(--accent); }
+
+  /* the picture guide */
+  .step { display: flex; gap: 14px; margin: 22px 0; }
+  .num { flex: none; width: 30px; height: 30px; border-radius: 50%; background: var(--mark); color: #fff;
+         font-weight: 700; text-align: center; line-height: 30px; margin-top: 2px; }
+  .step > div + div { min-width: 0; flex: 1; }
+  .step p { margin: 2px 0 10px; }
+  .shot { display: block; max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px;
+          box-shadow: 0 2px 10px rgba(0, 0, 0, .08); }
+  .shot.narrow { max-width: 520px; width: 100%; }
+  details { border: 1px solid var(--line); border-radius: 10px; padding: 0 16px; margin: 12px 0; }
+  details[open] { padding-bottom: 8px; }
+  summary { cursor: pointer; font-weight: 600; font-size: 18px; padding: 12px 0; }
+  .addr { display: flex; align-items: center; gap: 10px; max-width: 420px; padding: 8px 14px; border-radius: 20px;
+          background: var(--card); border: 1px solid var(--line); font: 15px "Segoe UI", sans-serif; }
+  .addr b { color: var(--muted); font-weight: 400; }
+  .folder { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 560px; padding: 12px;
+            background: var(--card); border: 1px solid var(--line); border-radius: 8px; font-size: 14px; }
+  .folder .box { flex: 1; min-width: 200px; padding: 4px 8px; background: var(--bg); border: 2px solid var(--mark);
+                 border-radius: 4px; font-family: Consolas, monospace; word-break: break-all; }
+  .folder .ok { padding: 4px 14px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); }
+
+  footer { color: var(--muted); font-size: 14px; text-align: center; border-top: 1px solid var(--line);
+           margin-top: 48px; padding-top: 20px; }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <img src="icon.png" alt="U-loader icon">
+  <h1>U-loader</h1>
+  <p class="tagline">A fast download manager for Windows, with a browser extension and video-site support.</p>
+  <div class="buttons">
+    <a class="btn primary" href="https://github.com/md-muqtadir-fuad/uloader/releases/latest">Download for Windows</a>
+  </div>
+  <p class="small">Version 1.3.0 &middot; Windows 10 and 11 (64-bit) &middot; 53 MB &middot; free for non-commercial use</p>
+  <p class="byline">by <a href="https://md-muqtadir-fuad.github.io/"><strong>Md. Muqtadir Fuad</strong></a></p>
+</header>
+
+<h2 id="install">Install</h2>
+<ol>
+  <li>Download <code>U-loader-Setup-1.3.0.exe</code> with the button above.</li>
+  <li>Run it: <em>I agree &rarr; Next &rarr; Install</em>. It installs for your Windows account only, with yt-dlp, FFmpeg and Deno included.</li>
+  <li>If Windows says <em>"Windows protected your PC"</em>, click <em>More info &rarr; Run anyway</em>.</li>
+</ol>
+
+<h2 id="browser">Add U-loader to your browser</h2>
+<p>The extension catches your downloads and puts a download button on videos. Browsers only let you add an
+extension from outside their store by hand, so it takes these steps once. U-loader opens a window with the same steps the
+first time it starts.</p>
+
+<div class="step"><div class="num">1</div><div>
+  <p>In U-loader's window, click <strong>Edge</strong> or <strong>Chrome</strong>. Your browser opens and the address of its extensions page is copied.</p>
+  <img class="shot" src="img/uloader-guide.png" width="531" height="370" alt="U-loader's window: Add U-loader to your browser" loading="lazy">
+</div></div>
+
+<div class="step"><div class="num">2</div><div>
+  <p>Click the address bar, paste (<strong>Ctrl+V</strong>) and press <strong>Enter</strong>. Or type the address yourself:</p>
+  <div class="addr"><b>Edge:</b> edge://extensions</div>
+  <div class="addr" style="margin-top:8px"><b>Chrome:</b> chrome://extensions</div>
+</div></div>
+
+<p>Then follow the pictures for your browser:</p>
+
+<details open>
+<summary>Microsoft Edge</summary>
+<div class="step"><div class="num">3</div><div>
+  <p>Turn on <strong>Developer mode</strong>, at the bottom left.</p>
+  <img class="shot narrow" src="img/edge-1-devmode.png" width="760" height="760" alt="Edge: the Developer mode switch at the bottom left" loading="lazy">
+</div></div>
+<div class="step"><div class="num">4</div><div>
+  <p>Click <strong>Load unpacked</strong>.</p>
+  <img class="shot" src="img/edge-2-load.png" width="860" height="300" alt="Edge: the Load unpacked button" loading="lazy">
+</div></div>
+<div class="step"><div class="num">5</div><div>
+  <p>A folder window opens. In U-loader's window click <strong>Copy</strong>, paste the folder into the
+  <strong>Folder</strong> box and click <strong>Select Folder</strong>.</p>
+  <div class="folder">Folder: <span class="box">C:\Users\<i>you</i>\AppData\Local\Programs\U-loader\extension</span> <span class="ok">Select Folder</span></div>
+</div></div>
+<div class="step"><div class="num">6</div><div>
+  <p>U-loader is now in the list.</p>
+  <img class="shot" src="img/edge-3-added.png" width="860" height="336" alt="Edge: U-loader in the list of extensions" loading="lazy">
+</div></div>
+</details>
+
+<details>
+<summary>Google Chrome</summary>
+<div class="step"><div class="num">3</div><div>
+  <p>Turn on <strong>Developer mode</strong>, at the top right.</p>
+  <img class="shot" src="img/chrome-1-devmode.png" width="760" height="64" alt="Chrome: the Developer mode switch at the top right" loading="lazy">
+</div></div>
+<div class="step"><div class="num">4</div><div>
+  <p>Click <strong>Load unpacked</strong>.</p>
+  <img class="shot" src="img/chrome-2-load.png" width="760" height="300" alt="Chrome: the Load unpacked button" loading="lazy">
+</div></div>
+<div class="step"><div class="num">5</div><div>
+  <p>A folder window opens. In U-loader's window click <strong>Copy</strong>, paste the folder into the
+  <strong>Folder</strong> box and click <strong>Select Folder</strong>.</p>
+  <div class="folder">Folder: <span class="box">C:\Users\<i>you</i>\AppData\Local\Programs\U-loader\extension</span> <span class="ok">Select Folder</span></div>
+</div></div>
+<div class="step"><div class="num">6</div><div>
+  <p>U-loader is now in the list.</p>
+  <img class="shot" src="img/chrome-3-added.png" width="520" height="388" alt="Chrome: U-loader in the list of extensions" loading="lazy">
+</div></div>
+</details>
+
+<div class="step"><div class="num">&check;</div><div>
+  <p>U-loader's window says <strong>Connected</strong>. That's it: download a file as usual, or hover over a video and click
+  the <strong>U-loader</strong> button.</p>
+  <img class="shot" src="img/uloader-guide-done.png" width="531" height="370" alt="U-loader's window: Connected" loading="lazy">
+</div></div>
+
+<h2 id="privacy">Your data</h2>
+<p>U-loader collects nothing about you: no accounts, no analytics, no tracking. Your downloads, settings and
+history stay on your computer.</p>
+<ul>
+  <li>The extension sends links only to the U-loader program on your own computer, and only for downloads you start
+      or that it catches. With a link it passes that site's cookies, so downloads that need you to be signed in work.</li>
+  <li>The program connects only to the sites you download from, and once a day to GitHub to check for a new version
+      (you can turn that off in Settings).</li>
+</ul>
+<p>Details: <a href="privacy.html">privacy policy</a>.</p>
+
+<h2 id="license">License</h2>
+<p>U-loader is free to use, study and change for non-commercial purposes, under the
+<a href="https://github.com/md-muqtadir-fuad/uloader/blob/main/LICENSE">PolyForm Noncommercial License 1.0.0</a>.
+Commercial use is not allowed. The setup also includes yt-dlp, FFmpeg and Deno, which keep
+<a href="https://github.com/md-muqtadir-fuad/uloader/blob/main/THIRD_PARTY_NOTICES.md">their own licenses</a>.</p>
+
+<footer>
+  Made by <a href="https://md-muqtadir-fuad.github.io/">Md. Muqtadir Fuad</a> &middot;
+  <a href="https://github.com/md-muqtadir-fuad/uloader">GitHub</a> &middot;
+  <a href="https://github.com/md-muqtadir-fuad/uloader/blob/main/LICENSE">License</a> &middot;
+  <a href="privacy.html">Privacy</a>
+</footer>
+
+</main>
+</body>
+</html>

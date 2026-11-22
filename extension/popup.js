@@ -61,6 +61,10 @@ async function checkConnection() {
     st.textContent = "connected";
     st.className = "status ok";
     $("version").textContent = "U-loader " + r.version + (r.ytdlp ? "" : " · video sites need yt-dlp");
+    // U-loader was updated but the browser still runs the old extension (#11)
+    const mine = chrome.runtime.getManifest().version;
+    if (r.version && r.version !== mine)
+      $("version").textContent = "U-loader " + r.version + " · reload this extension to update it (it is " + mine + ")";
     $("setup").hidden = true;
   } else {
     st.textContent = "not connected";

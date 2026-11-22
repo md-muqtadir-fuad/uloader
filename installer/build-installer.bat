@@ -3,7 +3,7 @@ rem Builds the U-loader setup program: installer\out\U-loader-Setup-<version>.ex
 rem   1. builds uloader.exe and uloader-gui.exe (build.bat)
 rem   2. collects the helper programs into installer\bin\ (each one optional):
 rem        yt-dlp.exe  - next to uloader.exe in the project folder, or on PATH
-rem        ffmpeg.exe  - on PATH        (winget install Gyan.FFmpeg)
+rem        ffmpeg.exe  - the small build: run  sh installer\build-ffmpeg.sh  first (Git Bash)
 rem        deno.exe    - on PATH        (winget install DenoLand.Deno)
 rem      A missing one is left out of the setup's components.
 rem   3. compiles uloader.iss with Inno Setup 6 (winget install JRSoftware.InnoSetup)
@@ -16,11 +16,12 @@ if errorlevel 1 exit /b 1
 if not exist bin mkdir bin
 if not exist out mkdir out
 call :collect yt-dlp.exe "..\yt-dlp.exe"
-call :collect ffmpeg.exe ""
+rem never the 200+ MB FFmpeg from PATH: only the small build made by build-ffmpeg.sh
+if exist bin\ffmpeg.exe (echo   ffmpeg.exe: the small build in installer\bin) else (echo   ffmpeg.exe: not built - run  sh installer\build-ffmpeg.sh  - the setup will not include it)
 call :collect deno.exe ""
 
-rem the licence page: U-loader's licence, then the helper programs' notices
-copy /y /b ..\LICENSE + ..\THIRD_PARTY_NOTICES.md out\license.txt >nul
+rem the licence page (plain text): U-loader's licence, then the helper programs
+copy /y /b ..\LICENSE + third-party.txt out\license.txt >nul
 
 set "ISCC="
 for %%P in ("%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" "%ProgramFiles%\Inno Setup 6\ISCC.exe") do (

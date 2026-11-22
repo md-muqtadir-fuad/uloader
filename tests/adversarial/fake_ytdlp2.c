@@ -3,12 +3,16 @@
  *   - FAKE_YTDLP_LOG: write the raw command line, then each argv[] as parsed by the CRT, one per line
  *   - FAKE_YTDLP_OUT: file whose bytes are printed verbatim to stdout
  *   - FAKE_YTDLP_RC : exit code (default 0)
+ *   - "-U" (self-update): prints FAKE_YTDLP_UPDATE_OUT (default "yt-dlp is up to date"); when that
+ *     text says "Updated", "<exe>.updated" is created and later runs print FAKE_YTDLP_OUT2 with
+ *     exit code 0 instead of FAKE_YTDLP_OUT / FAKE_YTDLP_RC (an update that fixed a broken site)
  * Build: gcc -O1 -municode fake_ytdlp2.c -o yt-dlp.exe
  */
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
+#include <string.h>
 #include <io.h>
 
 static void put_u8(FILE *f, const wchar_t *w)
@@ -36,8 +40,25 @@ int wmain(int argc, wchar_t **argv)
             fclose(f);
         }
     }
+    wchar_t upd[MAX_PATH + 16];
+    GetModuleFileNameW(NULL, upd, MAX_PATH);
+    wcscat(upd, L".updated");
+    for (int i = 1; i < argc; i++) {
+        if (wcscmp(argv[i], L"-U") != 0) continue;
+        char text[4096] = "yt-dlp is up to date (stable@2000.01.01 from yt-dlp/yt-dlp)\n";
+        wchar_t up[1024];
+        if (GetEnvironmentVariableW(L"FAKE_YTDLP_UPDATE_OUT", up, 1024)) {
+            FILE *f = _wfopen(up, L"rb");
+            if (f) { size_t r = fread(text, 1, sizeof text - 1, f); text[r] = 0; fclose(f); }
+        }
+        fputs(text, stdout);
+        if (strstr(text, "Updated")) { FILE *f = _wfopen(upd, L"wb"); if (f) fclose(f); }
+        return 0;
+    }
+    int updated = GetFileAttributesW(upd) != INVALID_FILE_ATTRIBUTES;
+
     wchar_t outp[1024];
-    if (GetEnvironmentVariableW(L"FAKE_YTDLP_OUT", outp, 1024)) {
+    if (GetEnvironmentVariableW(updated ? L"FAKE_YTDLP_OUT2" : L"FAKE_YTDLP_OUT", outp, 1024)) {
         FILE *f = _wfopen(outp, L"rb");
         if (f) {
             char b[8192];
@@ -48,6 +69,6 @@ int wmain(int argc, wchar_t **argv)
         }
     }
     char rc[16];
-    if (GetEnvironmentVariableA("FAKE_YTDLP_RC", rc, sizeof rc)) return atoi(rc);
+    if (!updated && GetEnvironmentVariableA("FAKE_YTDLP_RC", rc, sizeof rc)) return atoi(rc);
     return 0;
 }

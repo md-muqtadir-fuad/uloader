@@ -139,7 +139,39 @@ def t_formats_heights():
            "reply=%s" % reply)
 
 
-TESTS = [t_vext_traversal, t_title_newline, t_cmdline_roundtrip, t_planted_ytdlp, t_quality_args, t_formats_heights]
+def t_outdated_ytdlp_updates_and_retries():
+    """a video yt-dlp can no longer find: U-loader runs yt-dlp -U and tries once more (#10);
+    when -U finds nothing newer, it gives up instead of looping"""
+    d, exe = setup("selfupdate")
+    srv = os.path.join(d, "srv")
+    make_file_fast(os.path.join(srv, "v.bin"), 5000, 7)
+    S = Server(srv)
+    try:
+        upd = os.path.join(d, "update.txt")
+        open(upd, "w").write("Updating to stable@2099.01.01 ...\nUpdated yt-dlp to stable@2099.01.01 from yt-dlp/yt-dlp\n")
+        out2 = os.path.join(d, "ytout2.txt")
+        open(out2, "wb").write(ulvid([S.url("/f/v.bin")], ext="bin", title="fixed", vid="1").encode())
+        extra = {"FAKE_YTDLP_RC": "1", "FAKE_YTDLP_UPDATE_OUT": upd, "FAKE_YTDLP_OUT2": out2}
+        broken = "ERROR: [youtube] x: Requested format is not available\n"
+        out = os.path.join(d, "out")
+        rc, o, el, to = run(["--ytdlp", "-d", out, "https://www.youtube.com/watch?v=x"], os.path.join(d, "cwd"), 60,
+                            env=env_with_fake(d, broken, extra), exe=exe)
+        got = os.path.exists(os.path.join(out, "fixed [1].bin"))
+        report("outdated yt-dlp: updated and retried", rc == 0 and got and "updating it and trying again" in o,
+               "rc=%s files=%s %s" % (rc, os.listdir(out) if os.path.isdir(out) else None, tail(o, 3)))
+
+        # nothing newer: one -U, then the error - no loop
+        d2, exe2 = setup("selfupdate_none")
+        rc, o, el, to = run(["--ytdlp", "-d", os.path.join(d2, "out"), "https://www.youtube.com/watch?v=x"],
+                            os.path.join(d2, "cwd"), 60, env=env_with_fake(d2, broken, {"FAKE_YTDLP_RC": "1"}), exe=exe2)
+        report("yt-dlp already current: no retry loop", rc == 1 and not to and o.count("updating it and trying again") == 1,
+               "rc=%s %.1fs %s" % (rc, el, tail(o, 3)))
+    finally:
+        S.stop()
+
+
+TESTS = [t_vext_traversal, t_title_newline, t_cmdline_roundtrip, t_planted_ytdlp, t_quality_args, t_formats_heights,
+         t_outdated_ytdlp_updates_and_retries]
 
 if __name__ == "__main__":
     sel = sys.argv[1:]

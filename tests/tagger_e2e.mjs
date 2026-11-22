@@ -23,7 +23,9 @@ const ok = (n, c, i = "") => { results.push(!!c); console.log(`${c ? "PASS" : "F
 const proc = spawn(browser, ["--window-position=-2400,0", "--window-size=1100,800", `--user-data-dir=${profile}`,
   `--remote-debugging-port=${port}`, `--load-extension=${extDir}`, `--disable-extensions-except=${extDir}`,
   "--disable-features=DisableLoadExtensionCommandLineSwitch", "--no-first-run", "--no-default-browser-check",
-  "about:blank"], { stdio: "ignore" });
+  "about:blank"], { stdio: "ignore",
+  // the native host the browser starts keeps its data in the test profile, never %APPDATA%\U-loader
+  env: { ...process.env, ULOADER_DATA: join(profile, "uloader-data") } });
 
 const json = async (p) => (await fetch(`http://127.0.0.1:${port}${p}`)).json();
 async function waitFor(fn, ms, step = 200) {

@@ -13,7 +13,7 @@ commercial use where their license allows it.
 | Program | What U-loader uses it for | License |
 |---|---|---|
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | finding the video links on YouTube and 1800+ other sites | The Unlicense (public domain) |
-| [FFmpeg](https://ffmpeg.org) | joining separate video and audio streams, converting HLS streams to MP4 | GNU GPL version 3 (the build used is configured with `--enable-gpl --enable-version3`) |
+| [FFmpeg](https://ffmpeg.org) | joining separate video and audio streams, converting HLS streams to MP4 | GNU LGPL version 2.1 or later (a small build made by `installer/build-ffmpeg.sh`) |
 | [Deno](https://deno.com) | the JavaScript runtime yt-dlp needs to read YouTube in full quality | MIT |
 
 The installer's *Components* page lets you leave any of them out.
@@ -60,19 +60,21 @@ their own licenses; see the yt-dlp repository for the full list.
 ## FFmpeg
 
 FFmpeg is Copyright (c) 2000-2026 the FFmpeg developers.
-The build included is a Windows "full" build by gyan.dev
-(<https://www.gyan.dev/ffmpeg/builds/>), configured with
-`--enable-gpl --enable-version3`, and is therefore licensed under the
-**GNU General Public License, version 3**:
-<https://www.gnu.org/licenses/gpl-3.0.html>.
 
-**Source code.** The complete corresponding source code of FFmpeg is at
-<https://ffmpeg.org/download.html>, and the build provider lists the
-exact FFmpeg version and the sources of every library in the build at
-<https://www.gyan.dev/ffmpeg/builds/>. Every U-loader release that
-includes FFmpeg also publishes, next to the setup program, a link to (or
-an archive of) the source of the exact build it contains, as the GPL
-requires. You may redistribute and change FFmpeg under the GPL v3.
+The `ffmpeg.exe` included is a small build made for U-loader by
+[installer/build-ffmpeg.sh](installer/build-ffmpeg.sh): only the
+containers, parsers and a few audio decoders U-loader's stream copy needs.
+It is built without `--enable-gpl`, `--enable-version3` or
+`--enable-nonfree`, so it is licensed under the **GNU Lesser General
+Public License, version 2.1 or later**:
+<https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html>.
+
+**Source code.** Its complete source is the unmodified FFmpeg release
+tarball named in the script (for U-loader 1.3.0:
+<https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz>), configured with the
+options in the script; the installed `ffmpeg-build.txt` lists both. Every
+release that includes FFmpeg links to that tarball next to the setup
+program. You may redistribute, change and rebuild FFmpeg under the LGPL.
 
 ## Deno
 

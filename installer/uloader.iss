@@ -76,6 +76,7 @@ Source: "bin\yt-dlp.exe";             DestDir: "{app}"; Components: ytdlp; Flags
 #endif
 #if HaveFfmpeg
 Source: "bin\ffmpeg.exe";             DestDir: "{app}"; Components: ffmpeg; Flags: ignoreversion
+Source: "bin\ffmpeg-build.txt";       DestDir: "{app}"; Components: ffmpeg; Flags: ignoreversion skipifsourcedoesntexist
 #endif
 #if HaveDeno
 Source: "bin\deno.exe";               DestDir: "{app}"; Components: deno; Flags: ignoreversion
@@ -93,9 +94,11 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 ; native messaging registration for the browser extension (per user)
 Filename: "{app}\uloader.exe"; Parameters: "--install"; Tasks: browser; Flags: runhidden; \
     StatusMsg: "Connecting U-loader to your browsers..."
-Filename: "{app}\uloader-gui.exe"; Description: "Start U-loader now"; Flags: postinstall nowait skipifsilent
-Filename: "{app}\extension"; Description: "Show the browser extension folder (to add it to Chrome or Edge)"; \
-    Flags: postinstall shellexec skipifsilent unchecked
+; U-loader then shows how to add its browser extension (it cannot be added by a program)
+Filename: "{app}\uloader-gui.exe"; Description: "Start U-loader and add it to your browser"; Flags: postinstall nowait skipifsilent
+; a silent update started by U-loader itself (/RESTARTAPP) starts it again, in the tray with /TRAY
+Filename: "{app}\uloader-gui.exe"; Flags: nowait; Check: RestartApp(False)
+Filename: "{app}\uloader-gui.exe"; Parameters: "--tray"; Flags: nowait; Check: RestartApp(True)
 
 [UninstallRun]
 Filename: "{app}\uloader.exe"; Parameters: "--uninstall"; Flags: runhidden; RunOnceId: "DisconnectBrowsers"
@@ -103,3 +106,21 @@ Filename: "{app}\uloader.exe"; Parameters: "--uninstall"; Flags: runhidden; RunO
 [UninstallDelete]
 ; written by "uloader --install"; the downloads and %APPDATA%\U-loader are kept
 Type: files; Name: "{app}\uloader-host.json"
+
+[Code]
+{ U-loader runs the setup of an update with /VERYSILENT /RESTARTAPP [/TRAY]
+  and closes; the setup then starts it again the way it was. }
+function HasParam(const Name: String): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), Name) = 0 then
+      Result := True;
+end;
+
+function RestartApp(InTray: Boolean): Boolean;
+begin
+  Result := HasParam('/RESTARTAPP') and (HasParam('/TRAY') = InTray);
+end;

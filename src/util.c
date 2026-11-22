@@ -856,6 +856,46 @@ const char *ext_for_content_type(const char *ct)
 }
 
 /* ------------------------------------------------------------------ */
+/* U-loader's data folder and the browser extension's "I was here"      */
+/* ------------------------------------------------------------------ */
+char *uloader_data_dir(void)
+{
+    wchar_t buf[MAX_PATH * 2];
+    DWORD n = GetEnvironmentVariableW(L"ULOADER_DATA", buf, MAX_PATH * 2);   /* tests / portable use */
+    if (n && n < MAX_PATH * 2) return w_to_u8(buf);
+    n = GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH * 2);
+    if (n && n < MAX_PATH * 2) {
+        char *a = w_to_u8(buf), *d = path_join(a, "U-loader");
+        free(a);
+        return d;
+    }
+    char *e = exe_dir(), *d = path_join(e, "U-loader-data");
+    free(e);
+    return d;
+}
+
+/* The native host writes this when the extension talks to it, so the
+   window knows the extension has been added (#13). */
+void browser_mark_connected(void)
+{
+    char *dir = uloader_data_dir(), *p = path_join(dir, "browser.txt");
+    dir_create(dir);
+    FILE *f = fopen_u8(p, "wb");
+    if (f) { fprintf(f, "extension=connected\nlast=%lld\n", (long long)time(NULL)); fclose(f); }
+    free(p);
+    free(dir);
+}
+
+int browser_connected(void)
+{
+    char *dir = uloader_data_dir(), *p = path_join(dir, "browser.txt");
+    int r = file_exists(p);
+    free(p);
+    free(dir);
+    return r;
+}
+
+/* ------------------------------------------------------------------ */
 /* categories (#1): downloads sorted into sub-folders by file type     */
 /* ------------------------------------------------------------------ */
 static const char *CAT_NAMES[UL_NCATS] = { "Video", "Music", "Documents", "Compressed", "Programs", "Pictures" };

@@ -47,6 +47,7 @@ static void usage(void)
         "      --ytdlp           force the site extractor for this link\n"
         "      --ytdlp-args \"..\"  extra yt-dlp arguments\n"
         "      --get-ytdlp       install / update yt-dlp next to uloader.exe\n"
+        "      --check-update    is there a newer U-loader?\n"
         "      --install         connect U-loader to Chrome / Edge / Brave\n"
         "      --uninstall       remove the browser connection\n"
         "  -h, --help            show this help\n"
@@ -256,7 +257,7 @@ int main(void)
         /* a switch never takes "=value": "--insecure=0" must not switch it ON */
         static const char *switches[] = { "-h", "--help", "-v", "--version", "-k", "--insecure", "--playlist",
                                           "--overwrite", "--direct", "--ytdlp", "--get-ytdlp", "--install",
-                                          "--uninstall", "--categories" };
+                                          "--uninstall", "--categories", "--check-update" };
         for (size_t k = 0; eq && k < sizeof switches / sizeof *switches; k++)
             if (!strcmp(a, switches[k])) { ul_log(LOG_ERR, "option %s does not take a value", a); return 1; }
         if (OPT("-h", "--help")) { usage(); return 0; }
@@ -283,6 +284,22 @@ int main(void)
             cfg.max_height = !_stricmp(v, "audio") ? UL_AUDIO_ONLY : int_value(v, a, 0, 100000);
         }
         else if (!strcmp(a, "--categories")) cfg.by_category = 1;
+        else if (!strcmp(a, "--check-update")) {
+            ul_release rel;
+            char err[300];
+            int r = release_check(&rel, err, sizeof err);
+            if (r > 0) {
+                ul_log(LOG_OK, "U-loader %s is available (you have %s): %s", rel.version, UL_VERSION,
+                       rel.page[0] ? rel.page : "https://github.com/md-muqtadir-fuad/uloader/releases");
+                if (rel.setup_url[0]) ul_log(LOG_DIM, "  setup: %s", rel.setup_url);
+            } else if (r == 0) {
+                if (rel.version[0]) ul_log(LOG_OK, "You have the latest version (%s).", UL_VERSION);
+                else ul_log(LOG_OK, "No U-loader release has been published yet (you have %s).", UL_VERSION);
+            } else {
+                ul_log(LOG_ERR, "Could not check for updates: %s", err);
+            }
+            return r < 0 ? 1 : 0;
+        }
         else if (OPT("-f", "--format"))      set_str(&cfg.format, need_value(argc, argv, &i, eq, a));
         else if (OPT("-H", "--header")) {
             v = need_value(argc, argv, &i, eq, a);

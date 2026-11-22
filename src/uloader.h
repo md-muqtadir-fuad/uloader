@@ -228,6 +228,13 @@ int         category_of(const char *filename);
    cfg->by_category is on. malloc'ed. */
 char       *category_folder(const ul_config *cfg, const char *filename);
 
+/* U-loader's data folder: ULOADER_DATA, else %APPDATA%\U-loader. malloc'ed. */
+char *uloader_data_dir(void);
+/* The browser extension has talked to U-loader (#13): the native host
+   records it, the window asks. */
+void browser_mark_connected(void);
+int  browser_connected(void);
+
 /* Speed limiter for all downloads of this process together (#2). */
 void    speed_limit_set(int64_t bytes_per_sec);   /* 0 = off; applies at once */
 int64_t speed_limit_get(void);
@@ -372,6 +379,22 @@ int hls_run(http_session *s, const ul_config *cfg, const char *url,
 int is_video_site(const char *url);
 int ytdlp_run(http_session *s, ul_config *cfg, const char *url);
 int ytdlp_install(http_session *s, ul_config *cfg);
+/* "yt-dlp -U" (#10): 1 updated, 0 already the latest, -1 failed or no
+   yt-dlp. `msg` gets yt-dlp's last line or the reason. */
+int ytdlp_self_update(const ul_task *t, char *msg, size_t msglen);
+
+/* U-loader's own updates (#11): the latest release on GitHub (or
+   ULOADER_UPDATE_URL, for tests). */
+typedef struct {
+    char    version[32];         /* "1.4.0" */
+    char    page[512];           /* the release page */
+    char    setup_url[1024];     /* the setup attached to it, "" = none */
+    char    setup_name[128];
+    int64_t setup_size;          /* bytes, -1 = unknown */
+} ul_release;
+int version_newer(const char *a, const char *b);   /* 1 if version a is newer than b */
+/* 1 = a newer version is out, 0 = this is the latest, -1 = could not tell (err) */
+int release_check(ul_release *rel, char *err, size_t errlen);
 /* The picture heights (1080, 720, ...) the video at `url` is offered in,
    highest first, without downloading anything (#9). Returns how many were
    found (0 = none known), or -1 with `err` when yt-dlp is missing or failed.

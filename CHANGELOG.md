@@ -13,6 +13,16 @@
 - **Video quality per download** ([#3](https://github.com/md-muqtadir-fuad/uloader/issues/3)): the
   video button's menu and the extension popup offer Best, 2160p, 1440p, 1080p, 720p, 480p, 360p and
   Audio only. Also in the Add dialog and as `-q audio` on the command line.
+- **Updates** ([#10](https://github.com/md-muqtadir-fuad/uloader/issues/10),
+  [#11](https://github.com/md-muqtadir-fuad/uloader/issues/11)): once a day U-loader checks GitHub
+  for a new version and asks before updating; on Yes it downloads and installs silently when no
+  download is running, then starts again. yt-dlp updates itself, and a video that suddenly cannot
+  be found triggers a yt-dlp update and one more try. *Check for updates* in the tray menu,
+  `--check-update` on the command line.
+- **Only real qualities** ([#9](https://github.com/md-muqtadir-fuad/uloader/issues/9)): the video
+  button and the popup offer only the heights the video really has.
+- **Smaller setup** ([#12](https://github.com/md-muqtadir-fuad/uloader/issues/12)): a 3 MB FFmpeg
+  built for U-loader's stream copy instead of the 217 MB full build, now under the LGPL.
 - The browser keeps a download that U-loader cannot get (for example when the site answers
   "403 Forbidden" to anything but the browser), and says why.
 

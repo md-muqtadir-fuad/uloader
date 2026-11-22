@@ -19,7 +19,8 @@
 - HLS streams (`.m3u8`), FTP, magnet links and `.torrent` files
 - Sorts files into folders by type: Video, Music, Documents, Compressed, Programs, Pictures
 - One speed limit for all downloads, switched on and off from the toolbar
-- Window, command line and tray icon; no runtime needed (about 430 KB)
+- Keeps itself and yt-dlp up to date (asks before updating U-loader)
+- Window, command line and tray icon; no runtime needed (about 450 KB)
 
 ## Install
 
@@ -46,6 +47,12 @@ To build it yourself, see [Building](#building).
 | Quit | Right-click the tray icon → **Exit** (closing the window keeps downloads running) |
 
 Settings and the download list are stored in `%APPDATA%\U-loader`.
+
+**Updates.** Once a day U-loader checks GitHub for a new version (one small
+request to `api.github.com`). If there is one, it asks; on **Yes** it
+downloads and installs in the background when no download is running, then
+starts again. yt-dlp is kept up to date without asking. Turn this off in
+**Settings**, or check now from the tray menu.
 
 ### Browser extension
 
@@ -83,6 +90,7 @@ uloader [options] LINK...
 | `--cookies FILE` | use a `cookies.txt` export |
 | `-x HOST:PORT` | proxy |
 | `--get-ytdlp` | install or update yt-dlp |
+| `--check-update` | is there a newer U-loader? |
 | `--install` | connect the browsers (`--uninstall` to remove) |
 
 `uloader --help` lists every option. Ctrl+C pauses; run the same command again to resume.
@@ -97,7 +105,7 @@ uloader -i links.txt --categories
 
 | Problem | Fix |
 |---|---|
-| Video sites fail or show low qualities | **Settings → Install / update yt-dlp**, and install Deno (`winget install DenoLand.Deno`) |
+| Video sites fail or show low qualities | yt-dlp updates itself daily; to force it: **Settings → Install / update yt-dlp**. Install Deno (`winget install DenoLand.Deno`) |
 | Video and audio saved separately | Install FFmpeg (`winget install Gyan.FFmpeg`) |
 | Browser downloads are not caught | The popup must say *connected* (run `uloader --install`); check the file type list; turn off IDM's integration |
 | Files go into `Video\`, `Music\`, ... | Turn off **Sort into folders by type** in Settings |

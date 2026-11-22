@@ -32,3 +32,4 @@ desktop.ini
 # Setup program: collected helper programs and build output
 installer/bin/
 installer/out/
+installer/ffmpeg-build/

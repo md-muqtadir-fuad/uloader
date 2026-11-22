@@ -161,6 +161,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect(nxt)
         if head == "xhost" and len(parts) == 2:
             return self.redirect("http://localhost:%d/r/%s" % (PORT, parts[1]))
+        if head == "release" and len(parts) == 2:
+            # GitHub's "latest release" answer for version parts[1] (?evil=1: a setup link elsewhere)
+            # (?setup=FILE&size=N: the setup is ROOT/FILE of that size)
+            ver = parts[1]
+            sname = q.get("setup", ["three.bin"])[0]
+            setup = ("https://evil.example/U-loader-Setup-%s.exe" % ver if q.get("evil")
+                     else "http://127.0.0.1:%d/r/%s" % (PORT, sname))
+            ssize = int(q.get("size", ["3000007"])[0])
+            body = json.dumps({
+                "tag_name": "v" + ver, "html_url": "http://127.0.0.1:%d/page" % PORT,
+                "author": {"html_url": "https://github.com/someone"},
+                "assets": [{"name": "notes.txt", "browser_download_url": "http://127.0.0.1:%d/r/x" % PORT, "size": 1},
+                           {"name": "U-loader-Setup-%s.exe" % ver, "browser_download_url": setup, "size": ssize}],
+            }).encode()
+            return self.simple(200, body, ctype="application/json")
+        if head == "release-bad":
+            return self.simple(200, b'{"tag_name": ', ctype="application/json")
         if head == "setcookie" and len(parts) == 2:
             # a gate: sets a cookie on the redirect, the file needs it
             self.send_response(302)

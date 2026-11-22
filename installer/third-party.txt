@@ -1,0 +1,23 @@
+
+
+------------------------------------------------------------------------
+
+THIRD-PARTY PROGRAMS
+
+This setup can also install three separate programs. U-loader runs them as
+separate programs; they are not covered by U-loader's license above and
+keep their own licenses:
+
+  yt-dlp   finds the videos on video sites
+           The Unlicense (public domain)
+           https://github.com/yt-dlp/yt-dlp
+
+  FFmpeg   joins video and audio, converts streams to MP4
+           GNU LGPL version 2.1 or later
+           https://ffmpeg.org  (source: see ffmpeg-build.txt)
+
+  Deno     lets yt-dlp read YouTube in full quality
+           MIT License, Copyright 2018-2026 the Deno authors
+           https://github.com/denoland/deno
+
+The full notices are in THIRD_PARTY_NOTICES.md in the installation folder.

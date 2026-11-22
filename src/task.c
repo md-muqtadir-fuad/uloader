@@ -772,3 +772,100 @@ char *job_write(const char *url, const char *mode, const char *referer, const ch
     if (fclose(f) != 0 || !wok) { file_delete(path); free(path); return NULL; }
     return path;
 }
+
+/* ------------------------------------------------------------------ */
+/* U-loader's own updates (#11)                                        */
+/* ------------------------------------------------------------------ */
+#define UL_RELEASES_API "https://api.github.com/repos/md-muqtadir-fuad/uloader/releases/latest"
+#define UL_RELEASE_DL   "https://github.com/md-muqtadir-fuad/uloader/releases/download/"
+
+/* "v1.10.2" vs "1.9" - numbers compared one by one */
+int version_newer(const char *a, const char *b)
+{
+    if (*a == 'v' || *a == 'V') a++;
+    if (*b == 'v' || *b == 'V') b++;
+    while (*a || *b) {
+        long x = strtol(a, (char **)&a, 10), y = strtol(b, (char **)&b, 10);
+        if (x != y) return x > y;
+        if (*a == '.') a++;
+        if (*b == '.') b++;
+        if ((*a && !isdigit((unsigned char)*a)) || (*b && !isdigit((unsigned char)*b))) break;   /* "-beta": stop */
+    }
+    return 0;
+}
+
+int release_check(ul_release *rel, char *err, size_t errlen)
+{
+    memset(rel, 0, sizeof *rel);
+    rel->setup_size = -1;
+    err[0] = 0;
+    char env[512];
+    DWORD el = GetEnvironmentVariableA("ULOADER_UPDATE_URL", env, sizeof env);
+    int test = el > 0 && el < sizeof env;            /* tests point this at a local server */
+    const char *api = test ? env : UL_RELEASES_API;
+
+    ul_config *cfg = xcalloc(1, sizeof *cfg);
+    cfg_defaults(cfg);
+    cfg->user_agent = xstrdup(UL_NAME "/" UL_VERSION);   /* GitHub's API wants one */
+    cfg->timeout_sec = 20;
+    cfg->retries = 1;
+    cfg->headers[cfg->nheaders++] = xstrdup("Accept: application/vnd.github+json");
+    ul_task *t = task_new(api);
+    http_session *s = http_session_new(cfg, t);
+    size_t len = 0;
+    char *body = s ? http_get_body(s, api, NULL, -1, -1, HTTP_TEXT, &len, NULL, 1, err, errlen, NULL) : NULL;
+    if (s) http_session_free(s);
+    task_free(t);
+    cfg_free(cfg);
+    if (!body) {
+        /* GitHub answers 404 while no release is published: nothing newer */
+        if (str_istr(err, "HTTP 404")) { snprintf(err, errlen, "no release has been published yet"); return 0; }
+        if (!err[0]) snprintf(err, errlen, "no answer");
+        return -1;
+    }
+
+    int rc = -1;
+    char *tag = json_str(json_find(body, "tag_name"));      /* top-level keys only */
+    char *page = json_str(json_find(body, "html_url"));
+    const char *v = tag && (*tag == 'v' || *tag == 'V') ? tag + 1 : tag;
+    if (v && isdigit((unsigned char)*v) && strlen(v) < sizeof rel->version && !strpbrk(v, " \t\r\n")) {
+        snprintf(rel->version, sizeof rel->version, "%s", v);
+        if (page && (str_istarts(page, "https://") || test) && strlen(page) < sizeof rel->page)
+            snprintf(rel->page, sizeof rel->page, "%s", page);
+        /* the setup program attached to the release */
+        const char *p = json_find(body, "assets");
+        if (p && *(p = json_skip_ws(p)) == '[') {
+            for (p++;;) {
+                p = json_skip_ws(p);
+                if (*p != '{') break;
+                const char *obj = p;
+                char *name = json_str(json_find(obj, "name"));
+                char *url = json_str(json_find(obj, "browser_download_url"));
+                char *size = json_str(json_find(obj, "size"));
+                /* only from this project's own release downloads (a local
+                   server in the tests) */
+                int ok = name && url && str_istarts(name, "U-loader-Setup") && str_iends(name, ".exe") &&
+                         !strpbrk(name, "\\/:") && strlen(url) < sizeof rel->setup_url &&
+                         (str_istarts(url, UL_RELEASE_DL) || (test && str_istarts(url, "http://127.0.0.1:")));
+                if (ok && !rel->setup_url[0]) {
+                    snprintf(rel->setup_url, sizeof rel->setup_url, "%s", url);
+                    snprintf(rel->setup_name, sizeof rel->setup_name, "%s", name);
+                    rel->setup_size = size ? _strtoi64(size, NULL, 10) : -1;
+                }
+                free(name); free(url); free(size);
+                p = json_skip(obj);
+                if (!p) break;
+                p = json_skip_ws(p);
+                if (*p != ',') break;
+                p++;
+            }
+        }
+        rc = version_newer(rel->version, UL_VERSION) ? 1 : 0;
+    } else {
+        snprintf(err, errlen, "the answer has no version");
+    }
+    free(tag);
+    free(page);
+    free(body);
+    return rc;
+}

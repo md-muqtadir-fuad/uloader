@@ -7,6 +7,7 @@
  * done by U-loader's own multi-connection engine.
  */
 #include "uloader.h"
+#include <time.h>
 
 static const char *VIDEO_SITES[] = {
     "youtube.com", "youtu.be", "youtube-nocookie.com", "facebook.com", "fb.watch",
@@ -338,6 +339,28 @@ int ytdlp_run(http_session *s, ul_config *cfg, const char *url)
     int n = 0, cap = 0, code = 0;
     yt_diag diag;
     memset(&diag, 0, sizeof diag);
+    for (int round = 0; round < 2; round++) {
+    if (round == 1) {
+        /* Nothing found, and it does not look like a login wall or a
+           country block: sites change, and an old yt-dlp stops finding
+           videos. Update it and try once more (#10) - at most every few
+           hours, so a video that is really gone does not cause a loop. */
+        static volatile LONG64 last_try;
+        LONG64 now = (LONG64)time(NULL);
+        int outdated_look = !diag.need_login && !diag.geo &&
+                            (diag.no_format || diag.unsupported || diag.error[0] || code != 0);
+        if (n > 0 || task_aborted(t) || !outdated_look || now - last_try < 6 * 3600) break;
+        last_try = now;
+        tlog(t, LOG_DIM, "  yt-dlp may be out of date - updating it and trying again...");
+        char um[300];
+        if (ytdlp_self_update(t, um, sizeof um) != 1) {
+            tlog(t, LOG_DIM, "  %s", um[0] ? um : "yt-dlp was not updated");
+            break;
+        }
+        tlog(t, LOG_DIM, "  %s", um);
+        free(fmt);
+        fmt = ytdlp_format(cfg, ffmpeg != NULL);
+    }
     for (int attempt = 0; attempt < 2 && n == 0 && !task_aborted(t); attempt++) {
         if (attempt == 1) {
             /* the preferred formats do not exist: take whatever there is */
@@ -368,6 +391,8 @@ int ytdlp_run(http_session *s, ul_config *cfg, const char *url)
         }
         free(outp);
     }
+    if (n > 0) break;
+    }   /* rounds */
     if (jar) { file_delete(jar); free(jar); }
     free(fmt);
     free(exe);
@@ -520,27 +545,44 @@ int ytdlp_heights(const ul_config *cfg, const char *url, int *heights, int max, 
     return n;
 }
 
+int ytdlp_self_update(const ul_task *t, char *msg, size_t msglen)
+{
+    msg[0] = 0;
+    char *exe = find_tool("yt-dlp.exe");
+    if (!exe) { snprintf(msg, msglen, "yt-dlp is not installed"); return -1; }
+    sbuf cmd = { 0 };
+    cmd_append_arg(&cmd, exe);
+    cmd_append_arg(&cmd, "-U");
+    char *out = NULL;
+    int r = run_process(cmd.s, &out, t);
+    sb_free(&cmd);
+    free(exe);
+    int res = -1;
+    if (out) {
+        if (str_istr(out, "Updated yt-dlp to")) res = 1;          /* "Updated yt-dlp to stable@..." */
+        else if (str_istr(out, "is up to date")) res = 0;         /* "yt-dlp is up to date (...)" */
+        char *last = str_trim(out);
+        char *nl = strrchr(last, '\n');
+        snprintf(msg, msglen, "%s", nl ? nl + 1 : last);
+    }
+    if (res < 0 && !msg[0])
+        snprintf(msg, msglen, r == RUN_FAILED ? "yt-dlp could not be started" : "yt-dlp -U failed (exit code %d)", r);
+    free(out);
+    return res;
+}
+
 int ytdlp_install(http_session *s, ul_config *cfg)
 {
     ul_task *t = http_task(s);
     char *existing = find_tool("yt-dlp.exe");
     if (existing) {
         tlog(t, LOG_INFO, "yt-dlp found at %s - checking for updates...", existing);
-        sbuf cmd = { 0 };
-        cmd_append_arg(&cmd, existing);
-        cmd_append_arg(&cmd, "-U");
-        char *out = NULL;
-        int r = run_process(cmd.s, &out, t);
-        sb_free(&cmd);
-        if (out) {
-            char *last = str_trim(out);
-            char *nl = strrchr(last, '\n');
-            tlog(t, r == 0 ? LOG_OK : LOG_WARN, "%s", nl ? nl + 1 : last);
-        }
-        free(out);
         free(existing);
-        if (r == RUN_FAILED && task_aborted(t)) return 2;   /* stopped, not failed */
-        return r == 0 ? 0 : 1;
+        char msg[300];
+        int r = ytdlp_self_update(t, msg, sizeof msg);
+        if (msg[0]) tlog(t, r >= 0 ? LOG_OK : LOG_WARN, "%s", msg);
+        if (r < 0 && task_aborted(t)) return 2;                  /* stopped, not failed */
+        return r >= 0 ? 0 : 1;
     }
     char *dir = exe_dir();
     char *dest = path_join(dir, "yt-dlp.exe");

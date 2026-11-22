@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>U-loader - privacy</title>
+<link rel="icon" href="icon.png">
+<style>
+  :root { --bg: #ffffff; --fg: #1b1f24; --muted: #57606a; --line: #d8dee4; --accent: #2563eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0; --line: #30363d; --accent: #3b82f6; }
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 "Segoe UI", system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 30px; margin: 0 0 4px; }
+  h2 { font-size: 20px; margin: 32px 0 8px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+  .small { color: var(--muted); font-size: 14px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+<p><a href="index.html">&larr; U-loader</a></p>
+<h1>Privacy</h1>
+<p class="small">U-loader and its browser extension. Last updated 22 November 2026.</p>
+
+<h2>In short</h2>
+<p>U-loader collects nothing about you. There are no accounts, no analytics and no tracking.
+Everything stays on your computer.</p>
+
+<h2>The browser extension</h2>
+<ul>
+  <li>It sends a link to the U-loader program on your own computer, and only when you ask: the
+      video button, the right-click menu, the popup, or a download it catches.</li>
+  <li>With that link it passes the page address and the cookies of that site, so downloads that need
+      you to be signed in still work. These go only to U-loader on your computer, and from there
+      only to the site they belong to.</li>
+  <li>It notes which videos a page plays, so the popup can list them. This list stays in the browser
+      and is cleared when you close the tab.</li>
+  <li>It sends nothing to the developer or to anyone else.</li>
+</ul>
+
+<h2>The program</h2>
+<ul>
+  <li>It connects only to the sites you download from.</li>
+  <li>Once a day it asks GitHub whether there is a new version (one request to
+      <code>api.github.com</code>), and it runs yt-dlp's own update. You can turn both off in Settings.</li>
+  <li>Your settings and download list are stored in <code>%APPDATA%\U-loader</code> on your computer.</li>
+</ul>
+
+<h2>Contact</h2>
+<p>Questions: open an issue on <a href="https://github.com/md-muqtadir-fuad/uloader/issues">GitHub</a>.</p>
+</main>
+</body>
+</html>

@@ -123,6 +123,9 @@ chrome.runtime.onInstalled.addListener(() => {
     chrome.contextMenus.create({ id: "ul-selection", title: "Download selected links with U-loader", contexts: ["selection"] });
     chrome.contextMenus.create({ id: "ul-page", title: "Download video from this page (U-loader)", contexts: ["page", "frame"] });
   });
+  // say hello to U-loader right away: its "add the extension" window sees
+  // the extension has been added (#13)
+  native({ action: "ping" });
 });
 
 const LINK_RE = /\b(?:https?|ftp):\/\/[^\s"'<>]+|magnet:\?[^\s"'<>]+/gi;

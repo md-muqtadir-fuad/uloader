@@ -453,6 +453,8 @@ int native_host_main(void)
         char *msg = xmalloc((size_t)len + 1);
         if (!read_exact(in, msg, len)) { free(msg); return 1; }
         msg[len] = 0;
+        static int marked;
+        if (!marked) { marked = 1; browser_mark_connected(); }   /* the extension is in the browser (#13) */
         sbuf resp = { 0 };
         handle(msg, &resp);
         int ok = write_msg(out, resp.s);

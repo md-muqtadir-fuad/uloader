@@ -45,6 +45,9 @@ FIX = os.path.join(WORK, "fixture")
 LOG = os.path.join(WORK, "requests.log")
 os.makedirs(FIX)
 ENV = dict(os.environ)
+# U-loader writes into its data folder (the native host marks the extension as seen):
+# never the real %APPDATA%\U-loader
+ENV["ULOADER_DATA"] = os.path.join(WORK, "data")
 # keep the real yt-dlp / ffmpeg out of the way so results are predictable
 ENV["PATH"] = os.pathsep.join(p for p in ENV.get("PATH", "").split(os.pathsep)
                               if not os.path.isfile(os.path.join(p, "yt-dlp.exe")))
@@ -551,6 +554,27 @@ def hls_same_name_at_the_same_time():
     same(os.path.join(d, "dup.ts"), expected, "first download")
     same(os.path.join(d, "dup (1).ts"), expected, "second download")
     check(not [f for f in os.listdir(d) if f.endswith((".ulhls", ".ulpart"))], "leftovers: %s" % os.listdir(d))
+
+
+@test
+def update_check_against_github():
+    """--check-update against a fake GitHub API (#11): a newer release and its setup are found;
+    the same or an older version is "latest"; a broken answer fails cleanly; a setup link
+    outside the project's releases is ignored."""
+    def check_update(path):
+        env = dict(ENV, ULOADER_UPDATE_URL=BASE + path)
+        p = subprocess.run([EXE, "--check-update"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=60)
+        return p.returncode, p.stdout.decode("utf-8", "replace")
+    rc, out = check_update("/release/9.9.9")
+    check(rc == 0 and "9.9.9 is available" in out and ("setup: " + BASE + "/r/three.bin") in out, "newer: %d\n%s" % (rc, out))
+    rc, out = check_update("/release/1.3.0")
+    check(rc == 0 and "latest version" in out, "same: %d\n%s" % (rc, out))
+    rc, out = check_update("/release/1.2.9")
+    check(rc == 0 and "latest version" in out, "older: %d\n%s" % (rc, out))
+    rc, out = check_update("/release-bad")
+    check(rc == 1 and "Could not check" in out, "broken answer: %d\n%s" % (rc, out))
+    rc, out = check_update("/release/9.9.9?evil=1")
+    check(rc == 0 and "9.9.9 is available" in out and "setup:" not in out, "foreign setup link: %d\n%s" % (rc, out))
 
 
 @test

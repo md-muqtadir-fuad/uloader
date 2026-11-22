@@ -42,9 +42,12 @@
 #define WM_APP_SHOW      (WM_APP + 7)   /* host.c: "show yourself"           */
 #define WM_APP_TESTDPI   (WM_APP + 9)   /* tests only (ULOADER_TEST_DPI set): act as if the DPI became wParam */
 #define WM_APP_COLSIZED  (WM_APP + 10)  /* the user resized column wParam */
+#define WM_APP_UPDATE    (WM_APP + 11)  /* lParam: malloc'ed upd_job (a check finished) */
+#define WM_APP_UPDREADY  (WM_APP + 12)  /* wParam 1 = the new setup is downloaded */
 
 #define TIMER_TICK   1
 #define TIMER_SAVE   2
+#define TIMER_UPDATE 3            /* the daily update check (#10, #11) */
 #define TICK_MS      400
 
 #define ID_LIST      10
@@ -129,6 +132,9 @@ typedef struct {
     int   conns, max_active, limit_kb, clip, tray, tray_hint;
     int   cats;              /* sort into Video\, Music\ ... (#1) */
     int   limit_on;          /* speed limiter: limit_kb for all downloads together (#2) */
+    int   updates;           /* check for updates automatically (#10, #11) */
+    int   browser_guide;     /* show "Add U-loader to your browser" until it is done (#13) */
+    long long update_checked;   /* last automatic check, unix time */
     int   has_place, pl, pt, pr, pb, pmax;
     int   detail_h;          /* 96-dpi pixels */
     int   colw[NCOLS];       /* 96-dpi pixels */
@@ -176,6 +182,8 @@ static CRITICAL_SECTION g_help_lock;
 static sbuf      g_help_out;
 static volatile LONG g_help_seq, g_connect_busy, g_yt_busy;
 static HANDLE    g_connect_thread, g_yt_thread;
+static int       g_balloon_update;     /* the last tray balloon was about an update (#11) */
+static volatile LONG g_upd_busy;        /* an update check is running */
 static ul_task  *g_yt_task;
 
 /* DPI functions (Windows 10 1607+), loaded at run time */
@@ -206,6 +214,9 @@ static void update_status(void);
 static double g_status_note_until;     /* a status-bar note shows until then */
 static void open_add_dialog(const char *prefill, int topmost);
 static void do_exit(void);
+static void update_try_install(void);
+static void start_update_check(int manual);
+static void update_ask(void);
 static void layout(void);
 
 /* ------------------------------------------------------------------ */
@@ -621,6 +632,8 @@ static void settings_defaults(settings *s)
     s->limit_kb = 1024;           /* the limiter's value; it starts switched off */
     s->limit_on = 0;
     s->cats = 1;
+    s->updates = 1;
+    s->browser_guide = 1;
     s->clip = 1;
     s->tray = 1;
     s->detail_h = 250;
@@ -666,6 +679,9 @@ static void settings_load(void)
         }
         else if (!strcmp(k, "speed_limiter")) { g_set.limit_on = atoi(v) != 0; saw_limiter = 1; }
         else if (!strcmp(k, "categories")) g_set.cats = atoi(v) != 0;
+        else if (!strcmp(k, "updates")) g_set.updates = atoi(v) != 0;
+        else if (!strcmp(k, "browser_guide")) g_set.browser_guide = atoi(v) != 0;
+        else if (!strcmp(k, "update_checked")) g_set.update_checked = _strtoi64(v, NULL, 10);
         else if (!strncmp(k, "cat.", 4)) {             /* cat.Video=mp4 mkv ... (file types per folder) */
             for (int c = 0; c < UL_NCATS; c++)
                 if (!_stricmp(k + 4, category_name(c))) category_set_exts(c, v);
@@ -729,6 +745,8 @@ static void settings_save(void)
                "clipboard=%d\ntray=%d\ntray_hint=%d\ndetail=%d\n",
             g_set.conns, g_set.max_active, g_set.limit_kb, g_set.limit_on, g_set.cats,
             g_set.clip, g_set.tray, g_set.tray_hint, g_set.detail_h);
+    fprintf(f, "updates=%d\nupdate_checked=%lld\nbrowser_guide=%d\n", g_set.updates, g_set.update_checked,
+            g_set.browser_guide);
     for (int c = 0; c < UL_NCATS; c++) {               /* only lists the user changed */
         char *e = category_exts(c);
         if (strcmp(e, category_default_exts(c)) != 0) fprintf(f, "cat.%s=%s\n", category_name(c), e);
@@ -1333,6 +1351,7 @@ static void task_finished(item *it)
     redraw_item(it);
     list_changed();
     schedule();
+    update_try_install();                   /* a waiting update goes in once nothing downloads */
 }
 
 static void pause_item(item *it)
@@ -1603,6 +1622,7 @@ static void tray_tip(const wchar_t *tip)
 
 static void tray_balloon(const wchar_t *title, const char *text, DWORD flags)
 {
+    g_balloon_update = 0;                /* update_offer() sets it after its own balloon */
     if (!g_tray_added) return;
     NOTIFYICONDATAW nid;
     tray_base(&nid);
@@ -2340,6 +2360,7 @@ static void copy_links(void)
 static void modal_begin(void) { g_modal++; }
 static void modal_end(void)
 {
+    trace("modal end (%d left, exit pending %d)", g_modal - 1, g_exit_pending);
     if (--g_modal == 0 && g_exit_pending) PostMessageW(g_hwnd, WM_COMMAND, IDM_EXIT, 0);
 }
 
@@ -3321,6 +3342,120 @@ static void settings_refresh(HWND d, unsigned *shown, int *last_busy)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* "Add U-loader to your browser" (#13). Browsers do not let a program  */
+/* add an extension that is not in their store, so the user is walked   */
+/* through Load unpacked; the window notices when the extension talks   */
+/* to U-loader (browser_connected) and is not shown again.              */
+/* ------------------------------------------------------------------ */
+static int browser_installed(const wchar_t *exe)   /* registered under App Paths? */
+{
+    wchar_t key[200];
+    swprintf(key, 200, L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\%ls", exe);
+    HKEY h;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, key, 0, KEY_READ, &h) == ERROR_SUCCESS ||
+        RegOpenKeyExW(HKEY_CURRENT_USER, key, 0, KEY_READ, &h) == ERROR_SUCCESS) {
+        RegCloseKey(h);
+        return 1;
+    }
+    return 0;
+}
+
+static char *extension_dir(void)
+{
+    char *d = exe_dir(), *e = path_join(d, "extension");
+    free(d);
+    return e;
+}
+
+static void browser_status(HWND d)
+{
+    int ok = browser_connected();
+    SetDlgItemTextW(d, IDC_B_STATUS, ok ? L"\x2713  Connected - U-loader is ready in your browser."
+                                        : L"Not added yet. This window notices when it is.");
+    SetDlgItemTextW(d, IDCANCEL, ok ? L"Done" : L"Close");
+}
+
+static INT_PTR CALLBACK browser_proc(HWND d, UINT m, WPARAM w, LPARAM l)
+{
+    static HWND prev_dlg;
+    switch (m) {
+    case WM_INITDIALOG: {
+        prev_dlg = g_dlg;
+        g_dlg = d;
+        SendMessageW(d, WM_SETICON, ICON_SMALL, (LPARAM)g_icon_small);
+        char *ext = extension_dir();
+        set_dlg_text(d, IDC_B_PATH, ext);
+        free(ext);
+        EnableWindow(GetDlgItem(d, IDC_B_EDGE), browser_installed(L"msedge.exe"));
+        EnableWindow(GetDlgItem(d, IDC_B_CHROME), browser_installed(L"chrome.exe"));
+        CheckDlgButton(d, IDC_B_NOSHOW, g_set.browser_guide ? BST_UNCHECKED : BST_CHECKED);
+        browser_status(d);
+        /* the connection the extension talks through must be registered */
+        if (!browser_connected() && !g_connect_busy) {
+            HKEY h;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Edge\\NativeMessagingHosts\\com.uloader.host",
+                              0, KEY_READ, &h) == ERROR_SUCCESS) RegCloseKey(h);
+            else start_connect();
+        }
+        SetTimer(d, 1, 1000, NULL);
+        return TRUE;
+    }
+    case WM_TIMER:                              /* the hint stays until the extension connects */
+        if (browser_connected()) { browser_status(d); KillTimer(d, 1); }
+        return TRUE;
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case IDC_B_EDGE:
+        case IDC_B_CHROME: {
+            /* Browsers refuse to open their own pages (edge://, chrome://)
+               for another program, so the address goes to the clipboard and
+               the browser comes up for the user to paste it */
+            int edge = LOWORD(w) == IDC_B_EDGE;
+            clipboard_set(edge ? "edge://extensions" : "chrome://extensions");
+            ShellExecuteW(d, L"open", edge ? L"msedge.exe" : L"chrome.exe", NULL, NULL, SW_SHOWNORMAL);
+            SetDlgItemTextW(d, IDC_B_STATUS, edge
+                ? L"Copied edge://extensions - paste it into Edge's address bar (Ctrl+V) and press Enter."
+                : L"Copied chrome://extensions - paste it into Chrome's address bar (Ctrl+V) and press Enter.");
+            return TRUE;
+        }
+        case IDC_B_COPY: {
+            char *ext = extension_dir();
+            clipboard_set(ext);
+            free(ext);
+            SetDlgItemTextW(d, IDC_B_STATUS, L"Folder copied - paste it (Ctrl+V) into the Load unpacked folder box.");
+            return TRUE;
+        }
+        case IDC_B_FOLDER: {
+            char *ext = extension_dir();
+            wchar_t *we = u8_to_w(ext);
+            ShellExecuteW(d, L"open", we, NULL, NULL, SW_SHOWNORMAL);
+            free(we);
+            free(ext);
+            return TRUE;
+        }
+        case IDCANCEL:
+            g_set.browser_guide = IsDlgButtonChecked(d, IDC_B_NOSHOW) != BST_CHECKED;
+            if (browser_connected()) g_set.browser_guide = 0;
+            settings_save();
+            KillTimer(d, 1);
+            g_dlg = prev_dlg;
+            EndDialog(d, 0);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+static void open_browser_guide(HWND owner)
+{
+    if (g_exiting) return;
+    modal_begin();
+    DialogBoxParamW(g_inst, MAKEINTRESOURCEW(IDD_BROWSER), owner, browser_proc, 0);
+    modal_end();
+}
+
 static int settings_apply(HWND d)
 {
     char *dir = dlg_text(d, IDC_S_DIR);
@@ -3350,6 +3485,7 @@ static int settings_apply(HWND d)
     g_set.limit_kb = (int)lim;
     g_set.limit_on = lim_on;
     g_set.cats = IsDlgButtonChecked(d, IDC_S_CATS) == BST_CHECKED;
+    g_set.updates = IsDlgButtonChecked(d, IDC_S_UPDATES) == BST_CHECKED;
     g_set.clip = IsDlgButtonChecked(d, IDC_S_CLIP) == BST_CHECKED;
     g_set.tray = IsDlgButtonChecked(d, IDC_S_TRAY) == BST_CHECKED;
     clip_listen(g_set.clip);
@@ -3377,6 +3513,7 @@ static INT_PTR CALLBACK settings_proc(HWND d, UINT m, WPARAM w, LPARAM l)
         SetDlgItemInt(d, IDC_S_LIMIT, (UINT)g_set.limit_kb, FALSE);
         CheckDlgButton(d, IDC_S_LIMITON, g_set.limit_on ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(d, IDC_S_CATS, g_set.cats ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(d, IDC_S_UPDATES, g_set.updates ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(d, IDC_S_CLIP, g_set.clip ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(d, IDC_S_TRAY, g_set.tray ? BST_CHECKED : BST_UNCHECKED);
         char *ed = exe_dir();
@@ -3424,8 +3561,8 @@ static INT_PTR CALLBACK settings_proc(HWND d, UINT m, WPARAM w, LPARAM l)
             free(cur);
             return TRUE;
         }
-        case IDC_S_CONNECT:
-            start_connect();
+        case IDC_S_CONNECT:                  /* "Add to browser...": the step-by-step window (#13) */
+            open_browser_guide(d);
             settings_refresh(d, &shown, &last_busy);
             return TRUE;
         case IDC_S_YTDLP:
@@ -3745,6 +3882,7 @@ static void tray_menu(int x, int y)
     fmt_size((int64_t)g_set.limit_kb * 1024, ls, sizeof ls);
     swprintf(lim, 80, L"Speed &limiter (%hs/s)", ls);
     AppendMenuW(m, MF_STRING | (g_set.limit_on ? MF_CHECKED : 0), IDM_LIMITER, lim);
+    AppendMenuW(m, MF_STRING | (g_upd_busy || g_modal ? MF_GRAYED : 0), IDM_CHECKUPDATE, L"Check for &updates");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"E&xit");
     SetMenuDefaultItem(m, IDM_SHOW, FALSE);
@@ -3768,7 +3906,12 @@ static void tray_event(WPARAM wp, LPARAM lp)
         break;
     case NIN_BALLOONUSERCLICK:
         show_main();
-        if (g_notify_item && index_of(g_notify_item) >= 0) select_items(&g_notify_item, 1, g_notify_item);
+        if (g_balloon_update) {              /* "update available": ask now */
+            g_balloon_update = 0;
+            PostMessageW(g_hwnd, WM_COMMAND, IDM_UPDATEASK, 0);
+        } else if (g_notify_item && index_of(g_notify_item) >= 0) {
+            select_items(&g_notify_item, 1, g_notify_item);
+        }
         break;
     default:
         break;
@@ -3862,6 +4005,15 @@ static void on_command(int id, int code)
         break;
     case IDM_EXIT:
         do_exit();
+        break;
+    case IDM_CHECKUPDATE:                    /* tray menu (#11) */
+        start_update_check(1);
+        break;
+    case IDM_UPDATEASK:
+        update_ask();
+        break;
+    case IDM_BROWSERGUIDE:
+        if (!g_modal) open_browser_guide(g_hwnd);
         break;
     default:
         return;
@@ -4012,8 +4164,200 @@ static void stop_all_and_wait(DWORD ms)
         if (g_gone[i]->thread && WaitForSingleObject(g_gone[i]->thread, 0) == WAIT_OBJECT_0) task_finished(g_gone[i]);
 }
 
+/* ------------------------------------------------------------------ */
+/* updates (#10, #11): checked in the background, never in the way.     */
+/* yt-dlp updates itself quietly; for U-loader the user is asked once   */
+/* (when they come to the window), then the new setup downloads and     */
+/* installs silently when no download is running, and U-loader starts   */
+/* again.                                                               */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int        manual;          /* from the menu: say "no update" too */
+    int        yrc;             /* yt-dlp: 1 updated, 0 current, -1 failed, -2 none */
+    char       ymsg[300];
+    int        rc;              /* release_check */
+    ul_release rel;
+    char       err[300];
+} upd_job;
+
+enum { UPD_NONE, UPD_AVAILABLE, UPD_DOWNLOADING, UPD_READY };
+static int        g_upd_state;
+static ul_release g_upd_rel;
+static char      *g_upd_setup;          /* the downloaded setup */
+static int        g_upd_ask_pending;    /* ask when the user comes to the window */
+static HANDLE     g_mtx;                /* single-instance mutex: closed before the setup runs */
+
+static void status_note(const wchar_t *text)
+{
+    SendMessageW(g_sb, SB_SETTEXTW, 0, (LPARAM)text);
+    g_status_note_until = now_sec() + 8.0;
+}
+
+static unsigned __stdcall update_thread(void *arg)
+{
+    upd_job *j = arg;
+    char *yt = find_tool("yt-dlp.exe");
+    j->yrc = yt ? ytdlp_self_update(NULL, j->ymsg, sizeof j->ymsg) : -2;
+    free(yt);
+    j->rc = release_check(&j->rel, j->err, sizeof j->err);
+    if (!PostMessageW(g_hwnd, WM_APP_UPDATE, 0, (LPARAM)j)) free(j);
+    return 0;
+}
+
+static void start_update_check(int manual)
+{
+    if (g_exiting || g_upd_busy) return;
+    upd_job *j = xcalloc(1, sizeof *j);
+    j->manual = manual;
+    InterlockedExchange(&g_upd_busy, 1);
+    HANDLE th = (HANDLE)_beginthreadex(NULL, 0, update_thread, j, 0, NULL);
+    if (th) CloseHandle(th);
+    else { InterlockedExchange(&g_upd_busy, 0); free(j); }
+}
+
+/* a copy installed by the setup can update itself; a build run from its
+   source folder gets the release page instead */
+static int installed_by_setup(void)
+{
+    char *d = exe_dir(), *u = path_join(d, "unins000.exe");
+    int r = file_exists(u);
+    free(u);
+    free(d);
+    return r;
+}
+
+static int downloads_active(void)
+{
+    for (int i = 0; i < g_n; i++) if (g_items[i]->thread) return 1;
+    return 0;
+}
+
+/* run the downloaded setup silently; restart = start U-loader again after it */
+static void update_install(int restart)
+{
+    if (g_upd_state != UPD_READY || !g_upd_setup) return;
+    g_upd_state = UPD_NONE;
+    wchar_t params[160];
+    swprintf(params, 160, L"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS%ls%ls",
+             restart ? L" /RESTARTAPP" : L"", restart && !IsWindowVisible(g_hwnd) ? L" /TRAY" : L"");
+    if (g_mtx) { CloseHandle(g_mtx); g_mtx = NULL; }     /* the setup waits while it exists */
+    wchar_t *w = u8_to_w(g_upd_setup);
+    INT_PTR r = (INT_PTR)ShellExecuteW(NULL, L"open", w, params, NULL, SW_HIDE);
+    free(w);
+    trace("update: started %s (%d)", g_upd_setup, (int)r);
+    if (r > 32 && restart) PostMessageW(g_hwnd, WM_COMMAND, IDM_EXIT, 0);   /* the setup replaces us */
+}
+
+/* install now if nothing is downloading (otherwise when the last one ends, or at exit) */
+static void update_try_install(void)
+{
+    if (g_upd_state == UPD_READY && !g_exiting && !g_modal && !downloads_active()) update_install(1);
+}
+
+typedef struct { ul_release rel; char *dest; } upd_dl;
+
+static unsigned __stdcall update_download_thread(void *arg)
+{
+    upd_dl *d = arg;
+    ul_config *cfg = default_cfg();
+    cfg->overwrite = 1;
+    cfg->by_category = 0;
+    cfg->connections = 4;
+    ul_task *t = task_new(d->rel.setup_url);
+    http_session *s = http_session_new(cfg, t);
+    int rc = s ? download_url(s, cfg, d->rel.setup_url, d->dest, NULL, 0, 0) : 1;
+    if (s) http_session_free(s);
+    task_free(t);
+    cfg_free(cfg);
+    /* the file GitHub announced, complete - nothing else is run */
+    int ok = rc == 0 && file_exists(d->dest) && (d->rel.setup_size < 0 || file_size(d->dest) == d->rel.setup_size);
+    if (!ok) file_delete(d->dest);
+    if (!PostMessageW(g_hwnd, WM_APP_UPDREADY, (WPARAM)ok, (LPARAM)d->dest)) free(d->dest);
+    free(d);
+    return 0;
+}
+
+static void update_ask(void)
+{
+    g_upd_ask_pending = 0;
+    if (g_upd_state != UPD_AVAILABLE || g_modal || g_exiting) return;
+    int self = installed_by_setup() && g_upd_rel.setup_url[0];
+    wchar_t msg[600];
+    swprintf(msg, 600, self
+             ? L"U-loader %hs is available (you have %hs).\n\nUpdate now? It downloads in the background and "
+               L"installs itself when no download is running; U-loader then starts again."
+             : L"U-loader %hs is available (you have %hs).\n\nOpen the download page?",
+             g_upd_rel.version, UL_VERSION);
+    modal_begin();
+    int r = MessageBoxW(g_hwnd, msg, L"U-loader update", MB_YESNO | MB_ICONINFORMATION);
+    modal_end();
+    if (r != IDYES) return;                       /* asked again at the next daily check */
+    if (!self) {
+        wchar_t *w = u8_to_w(g_upd_rel.page[0] ? g_upd_rel.page : "https://github.com/md-muqtadir-fuad/uloader/releases");
+        ShellExecuteW(g_hwnd, L"open", w, NULL, NULL, SW_SHOWNORMAL);
+        free(w);
+        return;
+    }
+    wchar_t tmp[MAX_PATH + 1];
+    if (!GetTempPathW(MAX_PATH + 1, tmp)) return;
+    char *td = w_to_u8(tmp), *dir = path_join(td, "U-loader-update");
+    free(td);
+    dir_create(dir);
+    upd_dl *d = xcalloc(1, sizeof *d);
+    d->rel = g_upd_rel;
+    d->dest = path_join(dir, g_upd_rel.setup_name);
+    free(dir);
+    g_upd_state = UPD_DOWNLOADING;
+    HANDLE th = (HANDLE)_beginthreadex(NULL, 0, update_download_thread, d, 0, NULL);
+    if (th) { CloseHandle(th); status_note(L"Downloading the U-loader update in the background..."); }
+    else { g_upd_state = UPD_AVAILABLE; free(d->dest); free(d); }
+}
+
+/* a newer version: ask now if the user is looking at U-loader, else when they come to it */
+static void update_offer(void)
+{
+    if (g_hwnd == GetForegroundWindow() && IsWindowVisible(g_hwnd) && !g_modal) {
+        update_ask();
+        return;
+    }
+    g_upd_ask_pending = 1;
+    char text[200];
+    snprintf(text, sizeof text, "U-loader %s is available. Click here to update.", g_upd_rel.version);
+    tray_balloon(L"Update available", text, NIIF_INFO);
+    g_balloon_update = 1;
+}
+
+static void on_update_result(upd_job *j)
+{
+    trace("update check: rc %d, version %s, yt-dlp %d", j->rc, j->rel.version, j->yrc);
+    InterlockedExchange(&g_upd_busy, 0);
+    if (!j->manual) { g_set.update_checked = (long long)time(NULL); settings_save(); }
+    if (j->yrc == 1) {                                     /* yt-dlp: quietly, a note only */
+        wchar_t w[340];
+        swprintf(w, 340, L"yt-dlp updated: %hs", j->ymsg);
+        status_note(w);
+    }
+    if (j->rc > 0 && version_newer(j->rel.version, UL_VERSION)) {
+        if (g_upd_state == UPD_NONE || g_upd_state == UPD_AVAILABLE) {
+            g_upd_rel = j->rel;
+            g_upd_state = UPD_AVAILABLE;
+            if (j->manual) update_ask(); else update_offer();
+        }
+    } else if (j->manual) {
+        wchar_t msg[500];
+        if (j->rc == 0) swprintf(msg, 500, L"You have the latest version (%hs).%ls", UL_VERSION,
+                                 j->yrc == 1 ? L"\n\nyt-dlp was updated." : L"");
+        else swprintf(msg, 500, L"Could not check for updates:\n%hs", j->err);
+        modal_begin();
+        MessageBoxW(g_hwnd, msg, L"U-loader", MB_OK | (j->rc == 0 ? MB_ICONINFORMATION : MB_ICONWARNING));
+        modal_end();
+    }
+    free(j);
+}
+
 static void do_exit(void)
 {
+    trace("exit (exiting %d, modal %d)", g_exiting, g_modal);
     if (g_exiting) return;
     if (g_modal) {
         g_exit_pending = 1;
@@ -4031,6 +4375,8 @@ static void do_exit(void)
     stop_all_and_wait(5000);
     save_list();
     settings_save();
+    update_install(0);                      /* a downloaded update installs as U-loader closes */
+    trace("exit: saved, closing the window");
     DestroyWindow(g_hwnd);
 }
 
@@ -4068,6 +4414,7 @@ static void on_create(HWND hwnd)
     if (RegisterDragDrop(hwnd, &g_drop.iface) != S_OK) DragAcceptFiles(hwnd, TRUE);
 
     SetTimer(hwnd, TIMER_TICK, TICK_MS, NULL);
+    SetTimer(hwnd, TIMER_UPDATE, 20000, NULL);   /* the update check, a little after start */
 }
 
 static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
@@ -4184,7 +4531,31 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == TIMER_TICK) on_tick();
         else if (wp == TIMER_SAVE) save_list();
+        else if (wp == TIMER_UPDATE) {       /* first 20 s after start, then hourly: once a day */
+            SetTimer(hwnd, TIMER_UPDATE, 3600 * 1000, NULL);
+            if (g_set.updates && (long long)time(NULL) - g_set.update_checked >= 23 * 3600) start_update_check(0);
+        }
         return 0;
+    case WM_APP_UPDATE:
+        on_update_result((upd_job *)lp);
+        return 0;
+    case WM_APP_UPDREADY:
+        if (wp) {
+            free(g_upd_setup);
+            g_upd_setup = (char *)lp;
+            g_upd_state = UPD_READY;
+            status_note(L"The U-loader update is ready - it installs when no download is running.");
+            update_try_install();
+        } else {
+            free((char *)lp);
+            g_upd_state = UPD_AVAILABLE;
+            status_note(L"The U-loader update could not be downloaded; it will be offered again later.");
+        }
+        return 0;
+    case WM_ACTIVATE:                        /* the user came to U-loader: ask about a waiting update */
+        if (LOWORD(wp) != WA_INACTIVE && g_upd_ask_pending && !g_modal)
+            PostMessageW(hwnd, WM_COMMAND, IDM_UPDATEASK, 0);
+        break;
     case WM_APP_TASKDONE:
         task_finished((item *)lp);
         update_toolbar();
@@ -4408,6 +4779,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmdline, int show)
 
     /* one window per user session */
     HANDLE mtx = CreateMutexW(NULL, FALSE, L"Local\\ULoaderWindowSingleInstance");
+    g_mtx = mtx;                            /* closed by update_install() before the setup runs */
     /* owned only when the wait says so (WAIT_ABANDONED: its owner died -
        ours now); after a timeout it must not be released */
     int owned = mtx && WaitForSingleObject(mtx, 15000) != WAIT_TIMEOUT;
@@ -4488,6 +4860,10 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmdline, int show)
         modal_end();
     }
     if (nlinks) add_plain_links(links, nlinks);
+    /* the browser extension is not added yet (first start after the setup):
+       show how, once the window is up - not when starting in the tray (#13) */
+    if (!start_hidden && g_set.browser_guide && !browser_connected())
+        PostMessageW(g_hwnd, WM_COMMAND, IDM_BROWSERGUIDE, 0);
     free_strv(links, nlinks);
     free(job);
     detail_refresh(1);

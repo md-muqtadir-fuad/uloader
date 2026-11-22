@@ -64,7 +64,7 @@ def main():
     for d in (DATA, OUT, JOBS, SHOTS):
         os.makedirs(d)
     with open(os.path.join(DATA, "settings.txt"), "w", encoding="utf-8") as f:
-        f.write("dir=%s\n" % OUT)
+        f.write("dir=%s\nupdates=0\nbrowser_guide=0\n" % OUT)   # no update check (GitHub, yt-dlp -U) in tests
     port = U.free_port()
     srv = subprocess.Popen([sys.executable, "-I", os.path.join(PROJ, "tests", "server.py"), str(port), FIX,
                             os.path.join(T, "srv.log")])

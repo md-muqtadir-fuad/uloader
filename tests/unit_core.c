@@ -127,6 +127,12 @@ int main(void)
     CHECK(n2[0] == '_', "COM-superscript-1 is a device name: %s", n2);
     free(n2);
 
+    /* versions (#11) */
+    CHECK(version_newer("1.10.0", "1.9.9") && version_newer("v1.4", "1.3.9") && version_newer("2.0.0-beta", "1.9"),
+          "newer versions");
+    CHECK(!version_newer("1.3.0", "1.3.0") && !version_newer("1.3.0", "1.3.0.1") && !version_newer("1.2.9", "1.3"),
+          "not newer");
+
     /* categories (#1) */
     CHECK(category_of("Movie.MKV") == CAT_VIDEO, "mkv is a video");
     CHECK(category_of("song.mp3") == CAT_MUSIC && category_of("a.pdf") == CAT_DOCUMENTS, "mp3 / pdf");

@@ -11,6 +11,15 @@
 
 #define IDD_ADD             100
 #define IDD_SETTINGS        101
+#define IDD_BROWSER         102   /* "Add U-loader to your browser" (#13) */
+
+#define IDC_B_EDGE          1201
+#define IDC_B_CHROME        1202
+#define IDC_B_FOLDER        1203
+#define IDC_B_PATH          1204
+#define IDC_B_STATUS        1205
+#define IDC_B_NOSHOW        1206
+#define IDC_B_COPY          1207
 
 /* Add dialog */
 #define IDC_LINKS           1001
@@ -43,6 +52,7 @@
 #define IDC_S_VERSION       1116
 #define IDC_S_CATS          1117   /* sort into folders by type (#1)    */
 #define IDC_S_LIMITON       1118   /* total speed limit on/off (#2)     */
+#define IDC_S_UPDATES       1119   /* check for updates automatically (#10, #11) */
 
 /* Commands */
 #define IDM_ADD             40001
@@ -63,5 +73,8 @@
 #define IDM_LOGCOPY         40016
 #define IDM_LOGCOPYALL      40017
 #define IDM_LIMITER         40018   /* speed limiter on/off (#2) */
+#define IDM_CHECKUPDATE     40019   /* tray menu: check for updates now (#11) */
+#define IDM_UPDATEASK       40020   /* internal: ask "update now?" (#11) */
+#define IDM_BROWSERGUIDE    40021   /* "Add U-loader to your browser" window (#13) */
 
 #endif

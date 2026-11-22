@@ -41,7 +41,9 @@ const proc = spawn(browser, [
   "--disable-features=DisableLoadExtensionCommandLineSwitch",
   "--no-first-run", "--no-default-browser-check", "--autoplay-policy=no-user-gesture-required",
   "about:blank",
-], { stdio: "ignore" });
+], { stdio: "ignore",
+  // the native host the browser starts keeps its data in the test profile, never %APPDATA%\U-loader
+  env: { ...process.env, ULOADER_DATA: join(profile, "uloader-data") } });
 
 async function json(path) {
   const r = await fetch(`http://127.0.0.1:${port}${path}`);
