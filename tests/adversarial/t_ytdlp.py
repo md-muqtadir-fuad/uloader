@@ -108,7 +108,38 @@ def t_planted_ytdlp():
         S.stop()
 
 
-TESTS = [t_vext_traversal, t_title_newline, t_cmdline_roundtrip, t_planted_ytdlp]
+def t_quality_args():
+    """-q 720 asks yt-dlp for at most 720p, -q audio for the sound only (#3)"""
+    d, exe = setup("quality")
+    seen = {}
+    for q in ("720", "audio"):
+        log = os.path.join(d, "ytlog.txt")
+        if os.path.exists(log):
+            os.remove(log)
+        run(["-q", q, "https://www.youtube.com/watch?v=x"], os.path.join(d, "cwd"), 60, env=env_with_fake(d, ""), exe=exe)
+        argv = [l.split("=", 1)[1] for l in open(log, encoding="utf-8").read().splitlines() if l.startswith("ARGV[")]
+        seen[q] = argv[argv.index("-f") + 1] if "-f" in argv else None
+    ok = seen["720"] and "height<=720" in seen["720"] and seen["audio"] and seen["audio"].startswith("ba")
+    report("quality reaches yt-dlp (-q 720, -q audio)", bool(ok), "formats=%s" % seen)
+
+
+def t_formats_heights():
+    """the native host's "formats" answer: the heights yt-dlp lists, highest first, once each (#9)"""
+    import json
+    import struct
+    d, exe = setup("formats")
+    env = dict(os.environ)
+    env.update(env_with_fake(d, "WARNING: something\nULHEIGHTS\t[144, null, 1080, 720, 1080, 360, 99999]\n"))
+    msg = json.dumps({"action": "formats", "url": "https://www.youtube.com/watch?v=x"}).encode()
+    p = subprocess.Popen([exe, "chrome-extension://ednpijjpophhlcbidanppgjliblinjga/"], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=os.path.join(d, "cwd"))
+    out, _ = p.communicate(struct.pack("<I", len(msg)) + msg, timeout=60)
+    reply = json.loads(out[4:4 + struct.unpack("<I", out[:4])[0]]) if len(out) >= 4 else None
+    report("native host lists the video's qualities", reply == {"ok": True, "heights": [1080, 720, 360, 144]},
+           "reply=%s" % reply)
+
+
+TESTS = [t_vext_traversal, t_title_newline, t_cmdline_roundtrip, t_planted_ytdlp, t_quality_args, t_formats_heights]
 
 if __name__ == "__main__":
     sel = sys.argv[1:]

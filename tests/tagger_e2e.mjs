@@ -84,7 +84,7 @@ try {
   ok("extension worker ready", await waitFor(() => ext.eval(`typeof chrome !== "undefined" && !!chrome.storage`), 10000));
   // the extension's test sink: jobs are recorded, nothing reaches a real U-loader
   // (kept in extension storage, so it survives service-worker restarts)
-  await ext.eval(`chrome.storage.local.set({ __uloader_test_sink: true, __uloader_test_jobs: [] }).then(() => true)`);
+  await ext.eval(`chrome.storage.local.set({ __uloader_test_sink: true, __uloader_test_jobs: [], __uloader_test_heights: [1080, 720, 480] }).then(() => true)`);
   const jobsSent = () => ext.eval(`chrome.storage.local.get({ __uloader_test_jobs: [] }).then((x) => x.__uloader_test_jobs)`);
   const sinkOn = await ext.eval(`chrome.storage.local.get("__uloader_test_sink").then((x) => x.__uloader_test_sink === true)`);
   ok("test sink is on (nothing can reach a real U-loader)", sinkOn);
@@ -129,8 +129,20 @@ try {
     if (attr(tt.menu, "hidden") !== null) return null;
     return tt.items().map((i) => textOf(i.children?.[0] ?? i));
   }, 4000);
-  ok("menu lists the choices", labels && labels.includes("This video file") && labels.includes("Best quality from this page"),
+  ok("menu lists the choices", labels && labels.includes("This video file") && labels.includes("Video from this page"),
      JSON.stringify(labels));
+  {
+    // the test sink answers "this video has 1080p, 720p and 480p": only those are offered (#9)
+    const qualities = async () => {
+      const tt = await tagger(page);
+      const qs = [];
+      (function w(n) { if (!n) return; if ((attr(n, "class") || "").split(/\s+/).includes("q")) qs.push(textOf(n)); (n.children || []).forEach(w); })(tt.menu);
+      return qs;
+    };
+    const want = JSON.stringify(["Best", "1080p", "720p", "480p", "Audio"]);
+    const qs = await waitFor(async () => { const q = await qualities(); return JSON.stringify(q) === want ? q : null; }, 4000);
+    ok("the page's video offers only the qualities it has", qs, JSON.stringify(qs || await qualities()));
+  }
   const png = await page.send("Page.captureScreenshot", { format: "png", clip: { x: 0, y: 0, width: 760, height: 480, scale: 1 } });
   if (png.result?.data) writeFileSync(shot, Buffer.from(png.result.data, "base64"));
 
@@ -144,6 +156,23 @@ try {
   const toast = await waitFor(async () => { const tt = await tagger(page); return attr(tt.toast, "hidden") === null ? textOf(tt.toast) : null; }, 3000);
   ok("confirmation shown", toast && toast.includes("Sent to U-loader"), JSON.stringify(toast));
   ok("clicks on the button do not reach the player", (await page.eval(`document.getElementById("v").paused`)) === true);
+
+  // a quality picked in the menu travels with the job (#3)
+  await sleep(3200);                                          // let the confirmation go away
+  await hover(page, vr);
+  await waitFor(() => shown(page), 3000);
+  t = await tagger(page);
+  const goBox = await box(page, t.go);
+  await click(page, goBox.x + goBox.w / 2, goBox.y + goBox.h / 2);
+  const q720 = await waitFor(async () => {
+    const tt = await tagger(page);
+    return attr(tt.menu, "hidden") === null ? walk(tt.menu, (n) => n.localName === "button" && textOf(n) === "720p") : null;
+  }, 4000);
+  const qb = q720 && await box(page, q720);
+  if (qb) await click(page, qb.x + qb.w / 2, qb.y + qb.h / 2);
+  const jq = await waitFor(async () => { const j = await jobsSent(); return j && j.length >= 2 ? j[1] : null; }, 4000);
+  ok("picking 720p sends the page at 720p", jq && jq.mode === "ytdlp" && jq.quality === 720 && jq.url === `${base}/tagpage/clip.mp4`,
+     JSON.stringify(jq));
 
   // x hides it for this video
   t = await tagger(page);
@@ -168,7 +197,7 @@ try {
                      const h = document.querySelector("uloader-tagger"); if (h) h.click(); return true; })()`);
   await sleep(800);
   ok("fake play / mouse events from the page do not show it", !(await shown(page)));
-  ok("nothing was sent by the page", (await jobsSent()).length === 1);
+  ok("nothing was sent by the page", (await jobsSent()).length === 2);
 
   // switched off in the settings: never shown
   await ext.eval(`chrome.storage.local.set({ tagger: false }).then(() => true)`);
@@ -207,7 +236,7 @@ try {
   if (png2.result?.data) writeFileSync(shot.replace(/\.png$/i, "") + "-edge.png", Buffer.from(png2.result.data, "base64"));
   await page.close();
 
-  ok("every job went to the test sink (none to a real U-loader)", (await jobsSent()).length === 1);
+  ok("every job went to the test sink (none to a real U-loader)", (await jobsSent()).length === 2);
   b.close(); ext.close();
 } catch (e) {
   ok("unexpected error", false, String(e.stack || e));

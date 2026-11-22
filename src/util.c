@@ -856,6 +856,128 @@ const char *ext_for_content_type(const char *ct)
 }
 
 /* ------------------------------------------------------------------ */
+/* categories (#1): downloads sorted into sub-folders by file type     */
+/* ------------------------------------------------------------------ */
+static const char *CAT_NAMES[UL_NCATS] = { "Video", "Music", "Documents", "Compressed", "Programs", "Pictures" };
+static const char *CAT_DEFAULTS[UL_NCATS] = {
+    "mp4 mkv avi mov wmv flv webm m4v 3gp ts mts m2ts mpg mpeg ogv vob",
+    "mp3 m4a aac flac wav ogg oga opus wma alac aiff mka",
+    "pdf doc docx xls xlsx ppt pptx odt ods odp rtf txt csv epub mobi djvu",
+    "zip rar 7z gz tgz bz2 tbz2 xz txz tar zst lz lzma cab",
+    "exe msi msix msixbundle appx apk xapk dmg pkg deb rpm iso img jar",
+    "jpg jpeg png gif webp bmp svg tif tiff heic heif avif ico psd",
+};
+static char *g_cat_exts[UL_NCATS];        /* NULL = the default list */
+static SRWLOCK g_cat_lock = SRWLOCK_INIT;
+
+const char *category_name(int cat) { return cat >= 0 && cat < UL_NCATS ? CAT_NAMES[cat] : ""; }
+const char *category_default_exts(int cat) { return cat >= 0 && cat < UL_NCATS ? CAT_DEFAULTS[cat] : ""; }
+
+char *category_exts(int cat)
+{
+    if (cat < 0 || cat >= UL_NCATS) return xstrdup("");
+    AcquireSRWLockShared(&g_cat_lock);
+    char *r = xstrdup(g_cat_exts[cat] ? g_cat_exts[cat] : CAT_DEFAULTS[cat]);
+    ReleaseSRWLockShared(&g_cat_lock);
+    return r;
+}
+
+void category_set_exts(int cat, const char *exts)
+{
+    if (cat < 0 || cat >= UL_NCATS) return;
+    /* normalized: lower case, separated by single spaces, no dots */
+    char *v = NULL;
+    if (exts) {
+        sbuf b = { 0 };
+        for (const char *p = exts; *p;) {
+            p += strspn(p, " \t,;.");
+            size_t n = strcspn(p, " \t,;.");
+            if (!n) break;
+            if (n <= 16) {
+                if (b.len) sb_putc(&b, ' ');
+                for (size_t i = 0; i < n; i++) sb_putc(&b, (char)tolower((unsigned char)p[i]));
+            }
+            p += n;
+        }
+        v = sb_steal(&b);
+        if (!strcmp(v, CAT_DEFAULTS[cat])) { free(v); v = NULL; }
+    }
+    AcquireSRWLockExclusive(&g_cat_lock);
+    free(g_cat_exts[cat]);
+    g_cat_exts[cat] = v;
+    ReleaseSRWLockExclusive(&g_cat_lock);
+}
+
+static int word_in(const char *list, const char *w, size_t wl)
+{
+    for (const char *p = list; *p;) {
+        p += strspn(p, " ");
+        size_t n = strcspn(p, " ");
+        if (n == wl && _strnicmp(p, w, n) == 0) return 1;
+        p += n;
+    }
+    return 0;
+}
+
+int category_of(const char *filename)
+{
+    const char *ext = filename ? path_ext(filename) : "";
+    if (!*ext || !ext[1]) return -1;
+    ext++;                                            /* without the dot */
+    size_t el = strlen(ext);
+    int cat = -1;
+    AcquireSRWLockShared(&g_cat_lock);
+    for (int i = 0; i < UL_NCATS && cat < 0; i++)
+        if (word_in(g_cat_exts[i] ? g_cat_exts[i] : CAT_DEFAULTS[i], ext, el)) cat = i;
+    ReleaseSRWLockShared(&g_cat_lock);
+    return cat;
+}
+
+char *category_folder(const ul_config *cfg, const char *filename)
+{
+    const char *base = cfg->out_dir ? cfg->out_dir : ".";
+    int cat = cfg->by_category ? category_of(filename) : -1;
+    return cat < 0 ? xstrdup(base) : path_join(base, CAT_NAMES[cat]);
+}
+
+/* ------------------------------------------------------------------ */
+/* speed limiter (#2): one budget for every download of this process   */
+/* ------------------------------------------------------------------ */
+static volatile LONG64 g_rate;            /* bytes per second, 0 = off */
+static double g_rate_next;                /* when the budget allows the next byte */
+static SRWLOCK g_rate_lock = SRWLOCK_INIT;
+
+void speed_limit_set(int64_t bps)
+{
+    if (bps < 0) bps = 0;
+    AcquireSRWLockExclusive(&g_rate_lock);
+    InterlockedExchange64(&g_rate, bps);
+    g_rate_next = 0;                      /* a new limit starts from now, without old debt */
+    ReleaseSRWLockExclusive(&g_rate_lock);
+}
+
+int64_t speed_limit_get(void) { return g_rate; }
+
+void speed_limit_take(const ul_task *t, int64_t n)
+{
+    int64_t rate = g_rate;
+    if (rate <= 0 || n <= 0) return;
+    double now = now_sec();
+    AcquireSRWLockExclusive(&g_rate_lock);
+    if (g_rate_next < now - 0.25) g_rate_next = now - 0.25;   /* a quarter second of burst, no more */
+    g_rate_next += (double)n / (double)rate;
+    double due = g_rate_next;
+    ReleaseSRWLockExclusive(&g_rate_lock);
+    /* in short steps: a pause, or the limiter switched off or changed,
+       ends the wait at once */
+    while (g_rate == rate && !task_aborted(t)) {
+        double left = due - now_sec();
+        if (left <= 0) break;
+        Sleep(left > 0.1 ? 100 : (DWORD)(left * 1000) + 1);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* files                                                               */
 /* ------------------------------------------------------------------ */
 char *path_join(const char *dir, const char *name)

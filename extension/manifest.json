@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "U-loader",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Send downloads, videos and streams to U-loader, a fast multi-connection download manager.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsnFPGc8w6tNxUbe7sn4AryeGk5sZZ8XXKyAn+yxGVbkEOW9lJlw/XC9pVFKqKegtHv2OzXpCGmrgD8sP0LGdTyX6l82n2ZBkLgeFvWb8gThonstJmMSQyCUNM70sO/bXsNzmevRFr7V4FNeGo3TAyY25QMFi1cVmRH0nntUm6A/P0T/dFIkklsLQrzas8dmsSYOEzW2fhsNBXjWV4+GMIyggMxxBK0dCHKG6xJg2ZwAb/9XjWJ2FRHMk/T2clPv7mxG1pfq0NXOBBgQp5DhiO9pkc2oKboAqefNF/udnmlcJK6QyJU75UiyKfiYnjhwss+H6GLiVjHQS634LTSMJrwIDAQAB",
   "minimum_chrome_version": "110",

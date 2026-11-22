@@ -327,7 +327,9 @@ static char *pick_filename(const ul_config *cfg, const char *url, const http_res
     }
     char *clean = sanitize_filename(name);
     free(name);
-    char *path = path_join(cfg->out_dir, clean);
+    char *dir = category_folder(cfg, clean);        /* out_dir, or out_dir\Video ... (#1) */
+    char *path = path_join(dir, clean);
+    free(dir);
     free(clean);
     return path;
 }
@@ -509,7 +511,9 @@ int download_url(http_session *s, ul_config *cfg, const char *url, const char *f
     if (forced_path) path = xstrdup(forced_path);
     else if (cfg->out_name) {
         char *clean = sanitize_filename(path_basename(cfg->out_name));
-        path = path_join(cfg->out_dir, clean);
+        char *dir = category_folder(cfg, clean);
+        path = path_join(dir, clean);
+        free(dir);
         free(clean);
     } else path = pick_filename(cfg, url, &probe);
 
@@ -706,7 +710,10 @@ int job_load(const char *path, ul_config *cfg, char **url)
             int c = atoi(v);
             if (c >= 1 && c <= UL_MAX_CONN) cfg->connections = c;
         }
-        else if (!strcmp(k, "quality")) cfg->max_height = atoi(v);
+        else if (!strcmp(k, "quality")) {          /* a height, 0 = best, -1 = audio only */
+            int q = atoi(v);
+            cfg->max_height = q == UL_AUDIO_ONLY || (q >= 0 && q <= 100000) ? q : 0;
+        }
         else if (!strcmp(k, "cookies")) {
             free(cfg->cookie_file);
             cfg->cookie_file = xstrdup(v);
@@ -759,7 +766,7 @@ char *job_write(const char *url, const char *mode, const char *referer, const ch
     job_line(f, "name", name);
     job_line(f, "dir", dir);
     if (connections > 0) fprintf(f, "connections=%d\n", connections);
-    if (quality > 0) fprintf(f, "quality=%d\n", quality);
+    if (quality > 0 || quality == UL_AUDIO_ONLY) fprintf(f, "quality=%d\n", quality);
     job_line(f, "cookies", cookie_file);
     int wok = !ferror(f);
     if (fclose(f) != 0 || !wok) { file_delete(path); free(path); return NULL; }

@@ -61,29 +61,35 @@ function validUrl(u) {
   return typeof u === "string" && u.length < 16384 && /^(https?|ftp):\/\/|^magnet:\?/i.test(u);
 }
 
+// Video qualities a download can ask for (#3): the highest picture height,
+// 0 = best, -1 = the sound only. A missing height means the next lower one.
+const QUALITIES = new Set([0, 2160, 1440, 1080, 720, 480, 360, -1]);
+
 // mode: "auto" (let U-loader decide), "direct" (plain file), "ytdlp" (video page)
 // verify: ask U-loader to check it can really get the file before accepting
-async function sendToUloader({ url, referer = "", filename = "", mode = "auto", verify = false } = {}) {
+// quality: one of QUALITIES for this download; undefined = the popup's default
+async function sendToUloader({ url, referer = "", filename = "", mode = "auto", verify = false, quality } = {}) {
   if (!validUrl(url)) return { ok: false, error: "This kind of link cannot be downloaded." };
   if (!MODES.has(mode)) mode = "auto";
   if (typeof referer !== "string" || !/^https?:/i.test(referer)) referer = "";
   if (typeof filename !== "string") filename = "";
+  const s = await getSettings();
+  quality = Number(quality);
+  if (!QUALITIES.has(quality)) quality = QUALITIES.has(Number(s.quality)) ? Number(s.quality) : 0;
   // Automated tests switch this on from DevTools so nothing reaches a real
   // U-loader; pages can't touch extension storage.
   const t = await chrome.storage.local.get({ __uloader_test_sink: false, __uloader_test_reply: null });
   if (t.__uloader_test_sink) {
-    const s = await chrome.storage.local.get({ __uloader_test_jobs: [] });
-    s.__uloader_test_jobs.push({ url, referer, filename, mode, verify });
-    await chrome.storage.local.set({ __uloader_test_jobs: s.__uloader_test_jobs });
+    const j = await chrome.storage.local.get({ __uloader_test_jobs: [] });
+    j.__uloader_test_jobs.push({ url, referer, filename, mode, verify, quality });
+    await chrome.storage.local.set({ __uloader_test_jobs: j.__uloader_test_jobs });
     return t.__uloader_test_reply || { ok: true, via: "test" };
   }
-  const s = await getSettings();
   return native({
     action: "download",
-    url, referer, filename, mode, verify,
+    url, referer, filename, mode, verify, quality,
     ua: navigator.userAgent,
     connections: s.connections,
-    quality: s.quality,
     cookies: await cookiesFor(url),
   });
 }
@@ -280,6 +286,27 @@ chrome.tabs.onRemoved.addListener((tabId) => { incognitoTabs.delete(tabId); clea
 // ---------------------------------------------------------------------
 // popup / page button <-> background
 // ---------------------------------------------------------------------
+// The picture heights the video on `url` is offered in, highest first (#9):
+// { ok: true, heights: [1080, 720, ...] } or { ok: false, error }. U-loader
+// asks yt-dlp (nothing is downloaded); answers are kept for 10 minutes.
+async function qualitiesFor(url) {
+  if (typeof url !== "string" || !/^https?:/i.test(url) || url.length > 16384) return { ok: false, error: "no page" };
+  const key = "q:" + url;
+  try {
+    const c = (await chrome.storage.session.get(key))[key];
+    if (c && Date.now() - c.at < 10 * 60 * 1000) return c.res;
+  } catch (e) { /* no cache */ }
+  // the automated tests' sink: a fixed answer, nothing reaches U-loader
+  const t = await chrome.storage.local.get({ __uloader_test_sink: false, __uloader_test_heights: null });
+  if (t.__uloader_test_sink) return { ok: true, heights: t.__uloader_test_heights || [1080, 720, 480, 360] };
+  const res = await native({ action: "formats", url, ua: navigator.userAgent, cookies: await cookiesFor(url) });
+  const out = res && res.ok && Array.isArray(res.heights)
+    ? { ok: true, heights: res.heights.filter((h) => Number.isInteger(h) && h >= 100 && h <= 10000) }
+    : { ok: false, error: (res && res.error) || "no answer" };
+  if (out.ok) { try { await chrome.storage.session.set({ [key]: { at: Date.now(), res: out } }); } catch (e) { /* full */ } }
+  return out;
+}
+
 async function mediaFor(tabId) {
   if (typeof tabId !== "number") return [];
   return (await chrome.storage.session.get("tab_" + tabId))["tab_" + tabId] || [];
@@ -297,7 +324,9 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
         if (sender.tab.incognito) { reply({ ok: false, error: "not available in private windows" }); return; }
         if (msg.type === "download") {
           const j = msg.job || {};
-          reply(await sendToUloader({ url: j.url, referer: j.referer, mode: j.mode }));
+          reply(await sendToUloader({ url: j.url, referer: j.referer, mode: j.mode, quality: j.quality }));
+        } else if (msg.type === "qualities") {
+          reply(await qualitiesFor(sender.tab.url));     // only the page the button is on
         } else if (msg.type === "media-here") {
           reply(await mediaFor(sender.tab.id));
         } else {
@@ -310,6 +339,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       else if (msg.type === "open") reply(await native({ action: "open" }));
       else if (msg.type === "download") reply(await sendToUloader(msg.job || {}));
       else if (msg.type === "media") reply(await mediaFor(msg.tabId));
+      else if (msg.type === "qualities") reply(await qualitiesFor(msg.url));
       else reply({ ok: false, error: "unknown request" });
     } catch (e) {
       reply({ ok: false, error: String((e && e.message) || e) });

@@ -105,6 +105,7 @@ async function loadSettings() {
   $("exts").value = s.exts;
   $("connections").value = String(s.connections);
   $("quality").value = String(s.quality);
+  $("pageQuality").value = String(s.quality);       // this download starts at the default quality
 }
 
 function saveSettings() {
@@ -113,7 +114,7 @@ function saveSettings() {
     capture: $("capture").checked,
     exts: $("exts").value.trim() || DEFAULTS.exts,
     connections: Number($("connections").value) || 8,
-    quality: Number($("quality").value) || 0,
+    quality: Number($("quality").value) || 0,      // 0 best, a height, or -1 audio only
   });
 }
 
@@ -121,7 +122,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const pageOk = tab && /^https?:/i.test(tab.url || "");
   $("pageVideo").disabled = !pageOk;
-  $("pageVideo").addEventListener("click", (e) => send({ url: tab.url, mode: "ytdlp" }, e.currentTarget));
+  $("pageVideo").addEventListener("click", (e) =>
+    send({ url: tab.url, mode: "ytdlp", quality: Number($("pageQuality").value) }, e.currentTarget));
 
   $("linkForm").addEventListener("submit", (e) => {
     e.preventDefault();
@@ -153,4 +155,22 @@ document.addEventListener("DOMContentLoaded", async () => {
   await loadSettings();
   checkConnection();
   showMedia();
+  if (pageOk) pageQualities(tab.url);
 });
+
+// Only the qualities this page's video really has, once U-loader has
+// looked (#9); the full list stays when it cannot tell.
+async function pageQualities(url) {
+  const r = await ask({ type: "qualities", url });
+  if (!r || !r.ok || !Array.isArray(r.heights) || !r.heights.length) return;
+  const sel = $("pageQuality");
+  const want = Number(sel.value);
+  sel.textContent = "";
+  const add = (v, text) => { const o = document.createElement("option"); o.value = String(v); o.textContent = text; sel.append(o); };
+  add(0, "Best");
+  for (const h of r.heights) add(h, h + "p");
+  add(-1, "Audio only");
+  // keep the choice, or the best height below it
+  const pick = want > 0 ? (r.heights.find((h) => h <= want) ?? r.heights[r.heights.length - 1]) : want;
+  sel.value = String(pick);
+}

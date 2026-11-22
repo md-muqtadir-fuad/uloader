@@ -28,7 +28,7 @@
 _Static_assert(sizeof(void *) == 8, "U-loader is built for 64-bit Windows (x86_64 MinGW-w64)");
 
 #define UL_NAME        "U-loader"
-#define UL_VERSION     "1.1.0"
+#define UL_VERSION     "1.3.0"
 #define UL_MAX_CONN    32
 #define UL_MAX_HEADERS 48
 #define UL_SEGVIEW     64          /* resolution of the progress segment map */
@@ -56,6 +56,11 @@ typedef struct {
 
 enum { MODE_AUTO = 0, MODE_DIRECT = 1, MODE_YTDLP = 2 };
 
+#define UL_AUDIO_ONLY (-1)   /* max_height: the best audio, no video */
+
+/* Download categories: files sorted into sub-folders by type (#1). */
+enum { CAT_VIDEO, CAT_MUSIC, CAT_DOCUMENTS, CAT_COMPRESSED, CAT_PROGRAMS, CAT_PICTURES, UL_NCATS };
+
 typedef struct {
     int     connections;      /* connections per file                   */
     int     retries;          /* retries per connection / segment       */
@@ -66,7 +71,8 @@ typedef struct {
     int     playlist;         /* let yt-dlp expand playlists            */
     int     force_direct;     /* never use the site extractor           */
     int     force_ytdlp;      /* always use the site extractor          */
-    int     max_height;       /* video quality cap (e.g. 720), 0 = best */
+    int     max_height;       /* video quality cap (e.g. 720), 0 = best, UL_AUDIO_ONLY */
+    int     by_category;      /* save into out_dir\<Category>\ by file type */
     char   *out_name;         /* -o: output file name                   */
     char   *out_dir;          /* -d: output folder                      */
     char   *user_agent;
@@ -212,6 +218,21 @@ char *url_resolve(const char *base, const char *ref);
 char *sanitize_filename(const char *name);
 const char *ext_for_content_type(const char *ct);
 
+/* Categories (#1). A file name -> CAT_*, or -1 (stays in the folder itself). */
+const char *category_name(int cat);               /* "Video", "Music", ...   */
+const char *category_default_exts(int cat);
+char       *category_exts(int cat);               /* current list, malloc'ed */
+void        category_set_exts(int cat, const char *exts);   /* NULL = default */
+int         category_of(const char *filename);
+/* The folder `filename` is saved in: out_dir, or out_dir\<Category> when
+   cfg->by_category is on. malloc'ed. */
+char       *category_folder(const ul_config *cfg, const char *filename);
+
+/* Speed limiter for all downloads of this process together (#2). */
+void    speed_limit_set(int64_t bytes_per_sec);   /* 0 = off; applies at once */
+int64_t speed_limit_get(void);
+void    speed_limit_take(const ul_task *t, int64_t bytes);   /* waits as needed */
+
 /* files */
 char   *path_join(const char *dir, const char *name);
 const char *path_basename(const char *p);
@@ -351,6 +372,12 @@ int hls_run(http_session *s, const ul_config *cfg, const char *url,
 int is_video_site(const char *url);
 int ytdlp_run(http_session *s, ul_config *cfg, const char *url);
 int ytdlp_install(http_session *s, ul_config *cfg);
+/* The picture heights (1080, 720, ...) the video at `url` is offered in,
+   highest first, without downloading anything (#9). Returns how many were
+   found (0 = none known), or -1 with `err` when yt-dlp is missing or failed.
+   `t` (may be NULL) stops yt-dlp when it is aborted. */
+int ytdlp_heights(const ul_config *cfg, const char *url, int *heights, int max, const ul_task *t,
+                  char *err, size_t errlen);
 
 /* ------------------------------------------------------------------ */
 /* torrent.c - BitTorrent (.torrent files and magnet links)            */

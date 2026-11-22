@@ -108,15 +108,17 @@ static int write_at(HANDLE f, const char *buf, DWORD n, int64_t off)
 
 static void throttle(dl_ctx *c, int64_t n)
 {
-    int64_t lim = c->cfg->speed_limit;
-    if (lim <= 0) return;
-    LONG64 tot = InterlockedExchangeAdd64(&c->thr_bytes, n) + n;
-    double due = c->t0 + (double)tot / (double)lim;
-    double now = now_sec();
-    if (due > now) {
-        double ms = (due - now) * 1000.0;
-        ctx_sleep(c, (DWORD)(ms > 5000 ? 5000 : ms));
+    int64_t lim = c->cfg->speed_limit;       /* -l: this download */
+    if (lim > 0) {
+        LONG64 tot = InterlockedExchangeAdd64(&c->thr_bytes, n) + n;
+        double due = c->t0 + (double)tot / (double)lim;
+        double now = now_sec();
+        if (due > now) {
+            double ms = (due - now) * 1000.0;
+            ctx_sleep(c, (DWORD)(ms > 5000 ? 5000 : ms));
+        }
     }
+    speed_limit_take(c->t, n);               /* the window's limiter: all downloads together (#2) */
 }
 
 /* Give a finished worker something to do: an orphaned segment, or the
@@ -324,7 +326,10 @@ static unsigned __stdcall worker_main(void *arg)
 {
     worker_t *w = arg;
     dl_ctx *c = w->c;
-    DWORD bufsz = (c->cfg->speed_limit > 0 && c->cfg->speed_limit < 4 * BUF_SIZE) ? 16384 : BUF_SIZE;
+    /* small reads under a low limit keep the speed even (no bursts) */
+    int64_t glim = speed_limit_get();
+    DWORD bufsz = ((c->cfg->speed_limit > 0 && c->cfg->speed_limit < 4 * BUF_SIZE) ||
+                   (glim > 0 && glim < 4 * BUF_SIZE)) ? 16384 : BUF_SIZE;
     char *buf = xmalloc(bufsz);
     char err[256];
     int si = w->seg, attempt = 0;

@@ -14,11 +14,16 @@
   let enabled = false;                     // stays off until the setting is read
   let current = null;                      // the video the button is showing for
   let hideTimer = 0, trackTimer = 0, lastMove = 0, busy = false;
+  let defQuality = 0;                      // the popup's default video quality
   const dismissed = new WeakSet();
+  // the qualities the menu offers (#3): picture height, 0 = best, -1 = sound only
+  const QUALITIES = [[0, "Best"], [2160, "2160p"], [1440, "1440p"], [1080, "1080p"], [720, "720p"],
+                     [480, "480p"], [360, "360p"], [-1, "Audio"]];
 
-  chrome.storage.local.get({ tagger: true }, (s) => { enabled = !!s.tagger; });
+  chrome.storage.local.get({ tagger: true, quality: 0 }, (s) => { enabled = !!s.tagger; defQuality = Number(s.quality) || 0; });
   chrome.storage.onChanged.addListener((c) => {
     if (c.tagger) { enabled = !!c.tagger.newValue; if (!enabled) hide(); }
+    if (c.quality) defQuality = Number(c.quality.newValue) || 0;
   });
 
   // ---- the button, sealed off from the page ------------------------------
@@ -53,6 +58,11 @@
   .item:hover { background: rgba(37,99,235,.6); }
   .label { font-weight: 600; }
   .sub { color: #a5b4c8; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 340px; }
+  div.item:hover { background: transparent; }
+  .qrow { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; max-width: 340px; }
+  .q { padding: 3px 7px; border-radius: 4px; background: rgba(255,255,255,.12); font-size: 11px; font-weight: 600; }
+  .q:hover { background: #2563eb; }
+  .q.def { box-shadow: inset 0 0 0 1px #60a5fa; }
   .toast { margin-top: 4px; padding: 5px 9px; border-radius: 6px; background: rgba(15,18,25,.94); max-width: 300px; }
   .toast.bad { background: rgba(160,30,40,.95); }
   [hidden] { display: none !important; }
@@ -210,10 +220,10 @@
       opts.push({ label, sub: [nameOf(m.url), fmtSize(m.size)].filter(Boolean).join(" · "),
                   job: { url: m.url, referer: page, mode: "direct" } });
     }
-    // the page itself: yt-dlp finds the best quality (YouTube & co.)
+    // the page itself through yt-dlp (YouTube & co.), at the quality picked here
     if (/^https?:/i.test(page)) {
-      opts.push({ label: "Best quality from this page", sub: location.hostname + " · via yt-dlp",
-                  job: { url: page, mode: "ytdlp" } });
+      opts.push({ label: "Video from this page", sub: location.hostname + " · choose the quality",
+                  job: { url: page, mode: "ytdlp" }, qualities: true });
     }
     return opts;
   }
@@ -223,6 +233,38 @@
     toast.className = "toast" + (bad ? " bad" : "");
     toast.hidden = false;
     scheduleHide(bad ? 8000 : 3000);
+  }
+
+  // the quality buttons for the page's video. heights: the ones it has
+  // (highest first), null = still looking, false = unknown (offer them all)
+  function fillQualities(row, job, heights) {
+    row.textContent = "";
+    let list;
+    if (heights) list = [[0, "Best"], ...heights.map((h) => [h, h + "p"]), [-1, "Audio"]];
+    else if (heights === false) list = QUALITIES;
+    else list = [[0, "Best"], [-1, "Audio"]];
+    // the default quality, or the best one this video has below it
+    let def = defQuality;
+    if (heights && def > 0) def = heights.find((h) => h <= def) ?? heights[heights.length - 1];
+    for (const [q, name] of list) {
+      const qb = document.createElement("button");
+      qb.className = "q" + (q === def ? " def" : "");
+      qb.textContent = name;
+      qb.title = q > 0 ? (heights ? name : "Up to " + name + " (the next lower one if this video has no " + name + ")")
+                       : q < 0 ? "The sound only" : "The best quality there is";
+      qb.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (ev.isTrusted) send({ ...job, quality: q });
+      });
+      row.append(qb);
+    }
+    if (heights === null) {
+      const wait = document.createElement("span");
+      wait.className = "sub";
+      wait.textContent = "finding the qualities…";
+      wait.style.alignSelf = "center";
+      row.append(wait);
+    }
   }
 
   async function send(job) {
@@ -249,10 +291,11 @@
     const opts = await options();
     if (current !== forVideo || host.style.display === "none") return;   // hidden meanwhile
     if (!opts.length) { say("Nothing downloadable found here", true); return; }
-    if (opts.length === 1) { send(opts[0].job); return; }
+    if (opts.length === 1 && !opts[0].qualities) { send(opts[0].job); return; }
     menu.textContent = "";
     for (const o of opts) {
-      const b = document.createElement("button");
+      // a plain choice is one button; the page's video has a row of qualities
+      const b = document.createElement(o.qualities ? "div" : "button");
       b.className = "item";
       const l = document.createElement("div");
       l.className = "label";
@@ -261,10 +304,23 @@
       s.className = "sub";
       s.textContent = o.sub || "";
       b.append(l, s);
-      b.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        if (ev.isTrusted) send(o.job);
-      });
+      if (o.qualities) {
+        const row = document.createElement("div");
+        row.className = "qrow";
+        b.append(row);
+        // Best and Audio right away; the heights this video really has
+        // follow when U-loader has looked (#9); the full list if it can't
+        fillQualities(row, o.job, null);
+        ask({ type: "qualities" }).then((r) => {
+          if (!row.isConnected) return;
+          fillQualities(row, o.job, r && r.ok && Array.isArray(r.heights) && r.heights.length ? r.heights : false);
+        });
+      } else {
+        b.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          if (ev.isTrusted) send(o.job);
+        });
+      }
       menu.append(b);
     }
     toast.hidden = true;

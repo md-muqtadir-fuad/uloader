@@ -27,7 +27,10 @@ static void usage(void)
         "  -o, --output NAME     file name (only with a single link)\n"
         "  -i, --input FILE      read links from a text file (one per line) - a queue\n"
         "  -l, --limit RATE      speed limit, e.g. 500K or 2M (bytes per second)\n"
-        "  -q, --quality H       max video height, e.g. 720 or 1080 (default: best)\n"
+        "  -q, --quality H       max video height, e.g. 720 or 1080 (default: best);\n"
+        "                        \"audio\" = the sound only\n"
+        "      --categories      sort into sub-folders by type: Video, Music, Documents,\n"
+        "                        Compressed, Programs, Pictures (others stay in DIR)\n"
         "  -f, --format FMT      yt-dlp format selector (advanced)\n"
         "      --playlist        download every video of a playlist link\n"
         "  -H, --header \"K: V\"   add an HTTP header (repeatable)\n"
@@ -253,7 +256,7 @@ int main(void)
         /* a switch never takes "=value": "--insecure=0" must not switch it ON */
         static const char *switches[] = { "-h", "--help", "-v", "--version", "-k", "--insecure", "--playlist",
                                           "--overwrite", "--direct", "--ytdlp", "--get-ytdlp", "--install",
-                                          "--uninstall" };
+                                          "--uninstall", "--categories" };
         for (size_t k = 0; eq && k < sizeof switches / sizeof *switches; k++)
             if (!strcmp(a, switches[k])) { ul_log(LOG_ERR, "option %s does not take a value", a); return 1; }
         if (OPT("-h", "--help")) { usage(); return 0; }
@@ -275,7 +278,11 @@ int main(void)
             cfg.speed_limit = parse_size(v);
             if (cfg.speed_limit < 0) { ul_log(LOG_ERR, "bad speed limit: %s", v); return 1; }
         }
-        else if (OPT("-q", "--quality"))     cfg.max_height = int_value(need_value(argc, argv, &i, eq, a), a, 0, 100000);
+        else if (OPT("-q", "--quality")) {
+            v = need_value(argc, argv, &i, eq, a);
+            cfg.max_height = !_stricmp(v, "audio") ? UL_AUDIO_ONLY : int_value(v, a, 0, 100000);
+        }
+        else if (!strcmp(a, "--categories")) cfg.by_category = 1;
         else if (OPT("-f", "--format"))      set_str(&cfg.format, need_value(argc, argv, &i, eq, a));
         else if (OPT("-H", "--header")) {
             v = need_value(argc, argv, &i, eq, a);

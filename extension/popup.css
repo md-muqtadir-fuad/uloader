@@ -55,6 +55,11 @@ button.primary {
   padding: 8px 10px;
 }
 button.ghost { background: transparent; }
+/* "Download video on this page" + its quality for this download (#3) */
+.videorow { display: flex; gap: 6px; align-items: stretch; }
+.videorow button.primary { flex: 1; width: auto; }
+.videorow select { border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px;
+                   background: var(--bg); color: var(--fg); }
 .status { font-size: 12px; color: var(--muted); }
 .status::before { content: "●"; margin-right: 4px; }
 .status.ok { color: var(--ok); }

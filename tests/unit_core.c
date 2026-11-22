@@ -5,9 +5,18 @@
          -lole32 -loleaut32 -luuid -ladvapi32
    Run: unit_core.exe   (exit code 0 = all passed) */
 #include "uloader.h"
+#include <process.h>
 
 static int fails, checks;
 #define CHECK(c, ...) do { checks++; if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
+/* a "download" taking 200 KB from the shared speed limiter in 16 KB reads */
+static unsigned __stdcall limiter_user(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 200 / 16; i++) speed_limit_take(NULL, 16 * 1024);
+    return 0;
+}
 
 static void check_resolve(const char *base, const char *ref, const char *want)
 {
@@ -117,6 +126,49 @@ int main(void)
     char *n2 = sanitize_filename("COM\xC2\xB9.txt");
     CHECK(n2[0] == '_', "COM-superscript-1 is a device name: %s", n2);
     free(n2);
+
+    /* categories (#1) */
+    CHECK(category_of("Movie.MKV") == CAT_VIDEO, "mkv is a video");
+    CHECK(category_of("song.mp3") == CAT_MUSIC && category_of("a.pdf") == CAT_DOCUMENTS, "mp3 / pdf");
+    CHECK(category_of("x.7z") == CAT_COMPRESSED && category_of("setup.exe") == CAT_PROGRAMS, "7z / exe");
+    CHECK(category_of("p.webp") == CAT_PICTURES, "webp is a picture");
+    CHECK(category_of("data.xyz") == -1 && category_of("README") == -1 && category_of("x.") == -1, "no category");
+    category_set_exts(CAT_VIDEO, "MKV, .foo;bar");
+    CHECK(category_of("a.foo") == CAT_VIDEO && category_of("a.mp4") == -1, "a changed type list is used");
+    char *ce = category_exts(CAT_VIDEO);
+    CHECK(!strcmp(ce, "mkv foo bar"), "normalized list: [%s]", ce);
+    free(ce);
+    category_set_exts(CAT_VIDEO, NULL);
+    CHECK(category_of("a.mp4") == CAT_VIDEO, "back to the defaults");
+    ul_config cc;
+    cfg_defaults(&cc);
+    cc.out_dir = "D:\\Dl";
+    char *f1 = category_folder(&cc, "a.mp4");
+    cc.by_category = 1;
+    char *f2 = category_folder(&cc, "a.mp4"), *f3 = category_folder(&cc, "a.xyz");
+    CHECK(!strcmp(f1, "D:\\Dl") && !strcmp(f2, "D:\\Dl\\Video") && !strcmp(f3, "D:\\Dl"), "%s | %s | %s", f1, f2, f3);
+    free(f1); free(f2); free(f3);
+
+    /* speed limiter (#2): 400 KB at 200 KB/s ~ 1.75 s (0.25 s of burst) */
+    speed_limit_set(200 * 1024);
+    double t0 = now_sec();
+    for (int i = 0; i < 400 / 16; i++) speed_limit_take(NULL, 16 * 1024);
+    double el = now_sec() - t0;
+    CHECK(el > 1.4 && el < 2.6, "400 KB at 200 KB/s took %.2f s", el);
+    /* two downloads at once share the budget: 2 x 200 KB still ~1.75 s */
+    speed_limit_set(200 * 1024);
+    t0 = now_sec();
+    HANDLE th[2];
+    for (int i = 0; i < 2; i++) th[i] = (HANDLE)_beginthreadex(NULL, 0, limiter_user, NULL, 0, NULL);
+    WaitForMultipleObjects(2, th, TRUE, 10000);
+    for (int i = 0; i < 2; i++) CloseHandle(th[i]);
+    el = now_sec() - t0;
+    CHECK(el > 1.4 && el < 2.6, "two downloads, 400 KB together, took %.2f s", el);
+    /* switched off: no waiting at all */
+    speed_limit_set(0);
+    t0 = now_sec();
+    for (int i = 0; i < 1000; i++) speed_limit_take(NULL, 1 << 20);
+    CHECK(now_sec() - t0 < 0.1, "limiter off still waited");
 
     printf("%d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;

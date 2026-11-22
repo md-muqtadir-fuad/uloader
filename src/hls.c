@@ -358,6 +358,7 @@ static int fetch_segment(hls_ctx *c, int i, char *err, size_t errlen)
     char *data = http_get_body(c->s, url, c->hd, from, to, 0, &n, NULL, c->cfg->retries, err, errlen,
                                &c->bytes);
     if (!data) return 0;
+    speed_limit_take(http_task(c->s), (int64_t)n);   /* the window's limiter, shared by all (#2) */
     if (key >= 0) {
         uint8_t k[16], iv[16];
         if (!get_key(c, key, k, err, errlen)) { free(data); return 0; }
@@ -881,7 +882,9 @@ static char *default_base(const ul_config *cfg, const char *url)
         free(u);
     }
     char *clean = sanitize_filename(stem);
-    char *base = path_join(cfg->out_dir, clean);
+    char *dir = category_folder(cfg, "stream.mp4");   /* a stream is a video: Video\ (#1) */
+    char *base = path_join(dir, clean);
+    free(dir);
     free(clean);
     free(stem);
     free(fn);

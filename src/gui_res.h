@@ -41,6 +41,8 @@
 #define IDC_S_YTSTATUS      1114
 #define IDC_S_OUTPUT        1115
 #define IDC_S_VERSION       1116
+#define IDC_S_CATS          1117   /* sort into folders by type (#1)    */
+#define IDC_S_LIMITON       1118   /* total speed limit on/off (#2)     */
 
 /* Commands */
 #define IDM_ADD             40001
@@ -60,5 +62,6 @@
 #define IDM_RESUMEALL       40015
 #define IDM_LOGCOPY         40016
 #define IDM_LOGCOPYALL      40017
+#define IDM_LIMITER         40018   /* speed limiter on/off (#2) */
 
 #endif

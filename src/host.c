@@ -11,6 +11,7 @@
  * browser enforces "allowed_origins" from the manifest we register.
  */
 #include "uloader.h"
+#include <process.h>
 #include <ole2.h>
 #include <exdisp.h>
 #include <shldisp.h>
@@ -312,10 +313,58 @@ static int url_allowed(const char *u)
             str_istarts(u, "ftp://") || str_istarts(u, "magnet:?"));
 }
 
+/* a yt-dlp that hangs must not keep the browser waiting: stop it after a while */
+typedef struct { ul_task *t; HANDLE done; } watchdog;
+
+static unsigned __stdcall watchdog_main(void *arg)
+{
+    watchdog *w = arg;
+    if (WaitForSingleObject(w->done, 45000) == WAIT_TIMEOUT) InterlockedExchange(&w->t->abort, 1);
+    return 0;
+}
+
+/* {"action":"formats","url":...} -> {"ok":true,"heights":[1080,720,...]}: the
+   qualities the page's video is offered in, for the extension's menu (#9) */
+static void formats_reply(const char *msg, const char *url, sbuf *resp)
+{
+    ul_config *cfg = xcalloc(1, sizeof *cfg);
+    cfg_defaults(cfg);
+    cfg->user_agent = json_str(json_find(msg, "ua"));
+    cfg->cookie_file = write_cookie_file(msg);         /* the page's own cookies (signed-in videos) */
+    ul_task *t = task_new(url);
+    watchdog w = { t, CreateEventW(NULL, TRUE, FALSE, NULL) };
+    HANDLE th = w.done ? (HANDLE)_beginthreadex(NULL, 0, watchdog_main, &w, 0, NULL) : NULL;
+    int h[16];
+    char err[400];
+    int n = ytdlp_heights(cfg, url, h, 16, t, err, sizeof err);
+    if (w.done) SetEvent(w.done);
+    if (th) { WaitForSingleObject(th, INFINITE); CloseHandle(th); }
+    if (w.done) CloseHandle(w.done);
+    if (n < 0) {
+        sb_puts(resp, "{\"ok\":false,\"error\":");
+        json_put_string(resp, t->abort ? "yt-dlp took too long" : err);
+        sb_putc(resp, '}');
+    } else {
+        sb_puts(resp, "{\"ok\":true,\"heights\":[");
+        for (int i = 0; i < n; i++) sb_printf(resp, "%s%d", i ? "," : "", h[i]);
+        sb_puts(resp, "]}");
+    }
+    if (cfg->cookie_file) file_delete(cfg->cookie_file);
+    task_free(t);
+    cfg_free(cfg);
+}
+
 static void handle(const char *msg, sbuf *resp)
 {
     char *action = json_str(json_find(msg, "action"));
-    if (action && !strcmp(action, "ping")) {
+    if (action && !strcmp(action, "formats")) {
+        char *url = json_str(json_find(msg, "url"));
+        if (!url || !url_allowed(url) || !str_istarts(url, "http"))
+            sb_puts(resp, "{\"ok\":false,\"error\":\"unsupported link\"}");
+        else
+            formats_reply(msg, url, resp);
+        free(url);
+    } else if (action && !strcmp(action, "ping")) {
         char *yt = find_tool("yt-dlp.exe"), *ff = find_tool("ffmpeg.exe");
         sb_printf(resp, "{\"ok\":true,\"version\":\"%s\",\"ytdlp\":%s,\"ffmpeg\":%s,\"gui\":%s}",
                   UL_VERSION, yt ? "true" : "false", ff ? "true" : "false",

@@ -554,6 +554,33 @@ def hls_same_name_at_the_same_time():
 
 
 @test
+def categories_sort_by_type():
+    """--categories: a video into Video\\, a document into Documents\\, an unknown type into
+    the folder itself, a stream into Video\\; without the option everything stays put (#1)."""
+    d = outdir("cats")
+    for name in ("movie.mp4", "report.pdf", "data.xyz"):
+        rc, out, _ = run(["-d", d, "--categories", BASE + "/cd/three.bin?name=" + name])
+        check(rc == 0, "%s: exit %d\n%s" % (name, rc, out))
+    same(os.path.join(d, "Video", "movie.mp4"), F3, "video")
+    same(os.path.join(d, "Documents", "report.pdf"), F3, "document")
+    same(os.path.join(d, "data.xyz"), F3, "unknown type")
+    lines = ["#EXTM3U", "#EXT-X-TARGETDURATION:4"]
+    for i in range(3):
+        with open(os.path.join(FIX, "catseg%d.ts" % i), "wb") as f:
+            f.write(os.urandom(20000))
+        lines += ["#EXTINF:4.0,", "catseg%d.ts" % i]
+    lines.append("#EXT-X-ENDLIST")
+    with open(os.path.join(FIX, "catstream.m3u8"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    rc, out, _ = run(["-d", d, "--categories", BASE + "/r/catstream.m3u8"])
+    check(rc == 0, "stream: exit %d\n%s" % (rc, out))
+    check(os.path.exists(os.path.join(d, "Video", "catstream.ts")), "stream not in Video: %s" % os.listdir(d))
+    d2 = outdir("nocats")
+    rc, out, _ = run(["-d", d2, BASE + "/cd/three.bin?name=movie.mp4"])
+    check(rc == 0 and os.listdir(d2) == ["movie.mp4"], "without --categories: %s" % os.listdir(d2))
+
+
+@test
 def hls_wrong_key_fails():
     """A wrong AES-128 key fails the download instead of saving garbage as finished."""
     if shutil.which("openssl") is None:
@@ -721,6 +748,11 @@ def native_host_protocol():
                                     "verify": True}).encode()])
     check(res[0].get("ok") is False and res[0].get("status") == 403, "403 must be refused: %s" % res[0])
     check(res[1].get("ok") is False and "web page" in res[1].get("error", ""), "a login page must be refused: %s" % res[1])
+    # the video's qualities (#9): without yt-dlp a clear "no", never a hang; other links refused
+    rc, res = exchange([json.dumps({"action": "formats", "url": BASE + "/videopage/clip.mp4"}).encode(),
+                        json.dumps({"action": "formats", "url": "file:///C:/Windows/win.ini"}).encode()])
+    check(res[0].get("ok") is False and "yt-dlp" in res[0].get("error", ""), "formats without yt-dlp: %s" % res[0])
+    check(res[1].get("ok") is False, "formats of a file: link must be refused: %s" % res[1])
     # an oversized length prefix must not crash or hang the host
     p = subprocess.Popen([EXE, "chrome-extension://x/"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=ENV)
     p.communicate(struct.pack("<I", 0x7FFFFFFF) + b"{}", timeout=10)

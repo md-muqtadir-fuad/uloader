@@ -2620,6 +2620,17 @@ bad:
     peer_kill(p, "protocol violation");
 }
 
+/* bytes per second this torrent may download: its own -l limit and the
+   window's limiter (#2), whichever is lower; 0 = unlimited. The limiter is
+   applied through this non-blocking token bucket (the peer loop must not
+   sleep), so a torrent keeps to it on its own. */
+static int64_t dl_rate(const bt *b)
+{
+    int64_t own = b->cfg->speed_limit, all = speed_limit_get();
+    if (own <= 0) return all > 0 ? all : 0;
+    return all > 0 && all < own ? all : own;
+}
+
 static void peer_ready(bt *b, peer *p)        /* their handshake arrived */
 {
     p->st = PS_ACTIVE;
@@ -2782,7 +2793,7 @@ static void peer_recv(bt *b, peer *p)
             p->rb = xrealloc(p->rb, p->rcap);
             room = p->rcap - p->rlen;
         }
-        if (b->cfg->speed_limit > 0) {
+        if (dl_rate(b) > 0) {
             if (b->dl_tokens <= 0) break;
             if ((double)room > b->dl_tokens) room = (size_t)b->dl_tokens + 1;
         }
@@ -3754,7 +3765,7 @@ static void net_poll(bt *b, int wait_ms)
     FD_ZERO(&wr);
     FD_ZERO(&ex);
     int cnt = 0;
-    int can_read = b->cfg->speed_limit <= 0 || b->dl_tokens > 0;
+    int can_read = dl_rate(b) <= 0 || b->dl_tokens > 0;
     for (int i = 0; i < b->npeers; i++) {
         peer *p = b->p[i];
         if (p->dead) continue;
@@ -3900,9 +3911,10 @@ static int bt_main(bt *b)
             double dt = b->now - b->t_fill;
             if (dt < 0 || dt > 1) dt = 1;
             b->t_fill = b->now;
-            if (b->cfg->speed_limit > 0) {
-                double cap = (double)b->cfg->speed_limit * 0.5;
-                b->dl_tokens += (double)b->cfg->speed_limit * dt;
+            int64_t rate = dl_rate(b);
+            if (rate > 0) {
+                double cap = (double)rate * 0.5;
+                b->dl_tokens += (double)rate * dt;
                 if (b->dl_tokens > cap) b->dl_tokens = cap;
             }
             b->ul_tokens += b->ul_rate * dt;

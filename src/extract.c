@@ -122,6 +122,9 @@ static char *scoped_cookie_jar(const ul_config *cfg)
 static char *ytdlp_format(const ul_config *cfg, int have_ffmpeg)
 {
     if (cfg->format) return xstrdup(cfg->format);
+    /* the sound only: the best audio stream (plain HTTP first), a file with
+       sound as the last resort (#3) */
+    if (cfg->max_height == UL_AUDIO_ONLY) return xstrdup("ba[protocol^=http][protocol!*=dash]/ba/b");
     char h[32] = "";
     if (cfg->max_height > 0) snprintf(h, sizeof h, "[height<=%d]", cfg->max_height);
     /* Prefer plain HTTP(S) files: those get the multi-connection boost. */
@@ -136,8 +139,13 @@ static char *ytdlp_format(const ul_config *cfg, int have_ffmpeg)
 /* last resort when yt-dlp says the requested format is not available */
 #define YTDLP_ANY_FORMAT "bv*+ba/b/bv*/ba*"
 
+#define ULVID2_TEMPLATE "ULVID2\t%(ext)j\t%(requested_formats.0.ext)j\t%(requested_formats.1.ext)j\t" \
+                        "%(requested_formats.0.http_headers,http_headers)j\t%(requested_formats.1.http_headers)j\t" \
+                        "%(title)j\t%(id)j\t%(urls)j"
+
+/* print_tmpl: what yt-dlp prints for each video (ULVID2_TEMPLATE to download) */
 static char *ytdlp_command(const char *exe, const ul_config *cfg, const char *url, const char *fmt,
-                           const char *jar)
+                           const char *jar, const char *print_tmpl)
 {
     sbuf cmd = { 0 };
     cmd_append_arg(&cmd, exe);
@@ -173,9 +181,7 @@ static char *ytdlp_command(const char *exe, const ul_config *cfg, const char *ur
        media link. Fields: ext, video ext, audio ext, video headers, audio
        headers, title, id, links ("\n"-separated). */
     cmd_append_arg(&cmd, "--print");
-    cmd_append_arg(&cmd, "ULVID2\t%(ext)j\t%(requested_formats.0.ext)j\t%(requested_formats.1.ext)j\t"
-                         "%(requested_formats.0.http_headers,http_headers)j\t%(requested_formats.1.http_headers)j\t"
-                         "%(title)j\t%(id)j\t%(urls)j");
+    cmd_append_arg(&cmd, print_tmpl);
     /* --ytdlp-args: the user's own extra command line, spliced as typed */
     if (cfg->ytdlp_args) { sb_putc(&cmd, ' '); sb_puts(&cmd, cfg->ytdlp_args); }
     cmd_append_arg(&cmd, "--");
@@ -338,10 +344,10 @@ int ytdlp_run(http_session *s, ul_config *cfg, const char *url)
             if (!diag.no_format || cfg->format) break;
             tlog(t, LOG_DIM, "  the preferred formats are not offered - asking yt-dlp for any available format");
             free(fmt);
-            fmt = xstrdup(YTDLP_ANY_FORMAT);
+            fmt = xstrdup(cfg->max_height == UL_AUDIO_ONLY ? "ba/b" : YTDLP_ANY_FORMAT);
         }
         memset(&diag, 0, sizeof diag);
-        char *cmd = ytdlp_command(exe, cfg, url, fmt, jar);
+        char *cmd = ytdlp_command(exe, cfg, url, fmt, jar, ULVID2_TEMPLATE);
         char *outp = NULL;
         code = run_process(cmd, &outp, t);
         free(cmd);
@@ -385,15 +391,18 @@ int ytdlp_run(http_session *s, ul_config *cfg, const char *url)
         if (n > 1) tlog(t, LOG_INFO, "[%d/%d]", i + 1, n);
 
         char *final;
-        if (cfg->out_name && n == 1) {
-            char *clean = sanitize_filename(path_basename(cfg->out_name));
-            final = path_join(cfg->out_dir, clean);
-            free(clean);
-        } else {
-            char *nm = xasprintf("%s.%s", it->title, it->ext);
-            char *clean = sanitize_filename(nm);
-            final = path_join(cfg->out_dir, clean);
-            free(nm);
+        {
+            char *clean;
+            if (cfg->out_name && n == 1) {
+                clean = sanitize_filename(path_basename(cfg->out_name));
+            } else {
+                char *nm = xasprintf("%s.%s", it->title, it->ext);
+                clean = sanitize_filename(nm);
+                free(nm);
+            }
+            char *dir = category_folder(cfg, clean);   /* Video\ or Music\ (#1) */
+            final = path_join(dir, clean);
+            free(dir);
             free(clean);
         }
         if (file_exists(final) && !cfg->overwrite) {
@@ -460,6 +469,57 @@ int ytdlp_run(http_session *s, ul_config *cfg, const char *url)
 }
 
 /* Download (or update) yt-dlp.exe next to uloader.exe. */
+int ytdlp_heights(const ul_config *cfg, const char *url, int *heights, int max, const ul_task *t,
+                  char *err, size_t errlen)
+{
+    err[0] = 0;
+    char *exe = find_tool("yt-dlp.exe");
+    if (!exe) { snprintf(err, errlen, "yt-dlp is not installed"); return -1; }
+    ul_config one = *cfg;                 /* a shallow copy: only the playlist flag differs */
+    one.playlist = 0;
+    char *jar = scoped_cookie_jar(cfg);
+    /* the heights of every format (JSON list, null for audio-only ones);
+       a permissive format choice so the listing itself never fails */
+    char *cmd = ytdlp_command(exe, &one, url, YTDLP_ANY_FORMAT, jar, "ULHEIGHTS\t%(formats.:.height)j");
+    char *out = NULL;
+    int code = run_process(cmd, &out, t);
+    free(cmd);
+    free(exe);
+    if (jar) { file_delete(jar); free(jar); }
+
+    int n = 0, found = 0;
+    yt_diag diag;
+    memset(&diag, 0, sizeof diag);
+    for (char *cur = out, *line; cur && *cur;) {
+        char *nl = strchr(cur, '\n');
+        if (nl) *nl = 0;
+        line = str_trim(cur);
+        cur = nl ? nl + 1 : cur + strlen(cur);
+        if (strncmp(line, "ULHEIGHTS\t", 10) != 0) { diag_line(&diag, line); continue; }
+        found = 1;
+        for (const char *p = line + 10; *p;) {          /* [144, null, 1080, ...] */
+            if (!isdigit((unsigned char)*p)) { p++; continue; }
+            long h = strtol(p, (char **)&p, 10);
+            if (h < 100 || h > 10000) continue;
+            int i = 0;
+            while (i < n && heights[i] > h) i++;          /* keep them sorted, highest first */
+            if (i < n && heights[i] == h) continue;
+            if (n == max) { if (i >= n) continue; n--; }
+            memmove(&heights[i + 1], &heights[i], sizeof *heights * (size_t)(n - i));
+            heights[i] = (int)h;
+            n++;
+        }
+    }
+    free(out);
+    if (!found) {
+        if (diag.error[0]) snprintf(err, errlen, "%s", diag.error);
+        else if (code == RUN_FAILED) snprintf(err, errlen, "yt-dlp could not be started");
+        else snprintf(err, errlen, "yt-dlp found no video formats (exit code %d)", code);
+        return -1;
+    }
+    return n;
+}
+
 int ytdlp_install(http_session *s, ul_config *cfg)
 {
     ul_task *t = http_task(s);

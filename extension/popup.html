@@ -19,7 +19,14 @@
   </section>
 
   <section>
-    <button id="pageVideo" class="primary" type="button">Download video on this page</button>
+    <div class="videorow">
+      <button id="pageVideo" class="primary" type="button">Download video on this page</button>
+      <select id="pageQuality" title="Quality for this download">
+          <option value="0">Best</option><option value="2160">2160p</option><option value="1440">1440p</option>
+          <option value="1080">1080p</option><option value="720">720p</option><option value="480">480p</option>
+          <option value="360">360p</option><option value="-1">Audio only</option>
+      </select>
+    </div>
   </section>
 
   <section>
@@ -52,7 +59,7 @@
         <select id="quality">
           <option value="0">Best</option><option value="2160">2160p</option><option value="1440">1440p</option>
           <option value="1080">1080p</option><option value="720">720p</option><option value="480">480p</option>
-          <option value="360">360p</option>
+          <option value="360">360p</option><option value="-1">Audio only</option>
         </select>
       </label>
     </div>

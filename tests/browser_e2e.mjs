@@ -134,7 +134,7 @@ try {
   const tabTarget = tgt.result?.targetId;
   const media = await waitFor(async () => {
     const all = await ext.eval(`chrome.storage.session.get(null)`);
-    const lists = Object.values(all || {}).flat();
+    const lists = Object.entries(all || {}).filter(([k]) => k.startsWith("tab_")).flatMap(([, v]) => v);
     return lists.find((m) => m.url.includes("/v/clip.mp4"));
   }, 15000);
   ok("video on a page is detected", media, media ? `${media.kind}, ${media.size} bytes` : "");
@@ -150,7 +150,12 @@ try {
           finalUrl: ${JSON.stringify(base + "/r/" + name)}, filename: ${JSON.stringify(name)},
           referrer: ${JSON.stringify(base + "/videopage/clip.mp4")}, incognito: false })`);
     } else {
-      await browserWs.send("Target.createTarget", { url: `${base}/r/${name}` });
+      // the open page goes to the file, as a click would (a new tab opened
+      // through DevTools does not start a download in Edge)
+      const info = await waitFor(async () => (await json("/json/list")).find((t) => t.id === tabTarget), 5000);
+      const pg = await new CDP(info.webSocketDebuggerUrl).open();
+      await pg.send("Page.navigate", { url: `${base}/r/${name}` });
+      pg.close();
     }
     return waitFor(async () => (await ext.eval(`chrome.storage.session.get("lastCapture")`))?.lastCapture, 15000);
   };

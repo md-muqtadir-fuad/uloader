@@ -127,6 +127,8 @@ struct item {
 typedef struct {
     char *dir;
     int   conns, max_active, limit_kb, clip, tray, tray_hint;
+    int   cats;              /* sort into Video\, Music\ ... (#1) */
+    int   limit_on;          /* speed limiter: limit_kb for all downloads together (#2) */
     int   has_place, pl, pt, pr, pb, pmax;
     int   detail_h;          /* 96-dpi pixels */
     int   colw[NCOLS];       /* 96-dpi pixels */
@@ -190,9 +192,9 @@ static const IID IID_IShellItem_        = { 0x43826d1e, 0xe718, 0x42ee, { 0xbc, 
 static const IID IID_IUnknown_          = { 0x00000000, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
 static const IID IID_IDropTarget_       = { 0x00000122, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
 
-static const int  QUALITY_VALUES[] = { 0, 2160, 1440, 1080, 720, 480, 360 };
+static const int  QUALITY_VALUES[] = { 0, 2160, 1440, 1080, 720, 480, 360, UL_AUDIO_ONLY };
 static const wchar_t *QUALITY_NAMES[] = { L"Best available", L"2160p (4K)", L"1440p", L"1080p",
-                                          L"720p", L"480p", L"360p" };
+                                          L"720p", L"480p", L"360p", L"Audio only" };
 static const wchar_t *MODE_NAMES[] = { L"Auto (detect)", L"Direct file", L"Video page (yt-dlp)" };
 
 /* forward declarations */
@@ -616,7 +618,9 @@ static void settings_defaults(settings *s)
     s->dir = downloads_dir();
     s->conns = 8;
     s->max_active = 3;
-    s->limit_kb = 0;
+    s->limit_kb = 1024;           /* the limiter's value; it starts switched off */
+    s->limit_on = 0;
+    s->cats = 1;
     s->clip = 1;
     s->tray = 1;
     s->detail_h = 250;
@@ -632,6 +636,7 @@ static void settings_load(void)
     free(path);
     if (!data) return;
     char *cur = data;
+    int saw_limiter = 0;
     while (*cur) {
         char *nl = strchr(cur, '\n');
         if (nl) *nl = 0;
@@ -651,7 +656,20 @@ static void settings_load(void)
         }
         else if (!strcmp(k, "connections")) g_set.conns = clampi(atoi(v), 1, UL_MAX_CONN);
         else if (!strcmp(k, "max_active")) g_set.max_active = clampi(atoi(v), 1, 20);
-        else if (!strcmp(k, "speed_limit_kb")) g_set.limit_kb = clampi(atoi(v), 0, 10000000);
+        else if (!strcmp(k, "speed_limit_kb")) {
+            /* older settings: a value > 0 was a limit in use (then per download) */
+            int x = atoi(v);
+            if (x > 0) {
+                g_set.limit_kb = clampi(x, 1, 10000000);
+                if (!saw_limiter) g_set.limit_on = 1;
+            }
+        }
+        else if (!strcmp(k, "speed_limiter")) { g_set.limit_on = atoi(v) != 0; saw_limiter = 1; }
+        else if (!strcmp(k, "categories")) g_set.cats = atoi(v) != 0;
+        else if (!strncmp(k, "cat.", 4)) {             /* cat.Video=mp4 mkv ... (file types per folder) */
+            for (int c = 0; c < UL_NCATS; c++)
+                if (!_stricmp(k + 4, category_name(c))) category_set_exts(c, v);
+        }
         else if (!strcmp(k, "clipboard")) g_set.clip = atoi(v) != 0;
         else if (!strcmp(k, "tray")) g_set.tray = atoi(v) != 0;
         else if (!strcmp(k, "tray_hint")) g_set.tray_hint = atoi(v) != 0;
@@ -707,8 +725,15 @@ static void settings_save(void)
     if (!f) return;
     fputs("# U-loader window settings\n", f);
     put_kv(f, "dir", g_set.dir);
-    fprintf(f, "connections=%d\nmax_active=%d\nspeed_limit_kb=%d\nclipboard=%d\ntray=%d\ntray_hint=%d\ndetail=%d\n",
-            g_set.conns, g_set.max_active, g_set.limit_kb, g_set.clip, g_set.tray, g_set.tray_hint, g_set.detail_h);
+    fprintf(f, "connections=%d\nmax_active=%d\nspeed_limit_kb=%d\nspeed_limiter=%d\ncategories=%d\n"
+               "clipboard=%d\ntray=%d\ntray_hint=%d\ndetail=%d\n",
+            g_set.conns, g_set.max_active, g_set.limit_kb, g_set.limit_on, g_set.cats,
+            g_set.clip, g_set.tray, g_set.tray_hint, g_set.detail_h);
+    for (int c = 0; c < UL_NCATS; c++) {               /* only lists the user changed */
+        char *e = category_exts(c);
+        if (strcmp(e, category_default_exts(c)) != 0) fprintf(f, "cat.%s=%s\n", category_name(c), e);
+        free(e);
+    }
     if (g_set.has_place)
         fprintf(f, "window=%d,%d,%d,%d,%d\n", g_set.pl, g_set.pt, g_set.pr, g_set.pb, g_set.pmax);
     fputs("columns=", f);
@@ -726,8 +751,25 @@ static ul_config *default_cfg(void)
     cfg_defaults(c);
     c->out_dir = xstrdup(g_set.dir);
     c->connections = g_set.conns;
-    c->speed_limit = (int64_t)g_set.limit_kb * 1024;
+    c->speed_limit = 0;              /* the limiter is shared by all downloads: apply_limiter() */
+    c->by_category = g_set.cats;
     return c;
+}
+
+/* the speed limiter as set in the window, for every download at once (#2) */
+static void apply_limiter(void)
+{
+    speed_limit_set(g_set.limit_on && g_set.limit_kb > 0 ? (int64_t)g_set.limit_kb * 1024 : 0);
+}
+
+/* same folder? ("C:\Downloads" and "c:\downloads\" are) */
+static int same_dir(const char *a, const char *b)
+{
+    if (!a || !b) return 0;
+    size_t la = strlen(a), lb = strlen(b);
+    while (la && (a[la - 1] == '\\' || a[la - 1] == '/')) la--;
+    while (lb && (b[lb - 1] == '\\' || b[lb - 1] == '/')) lb--;
+    return la == lb && _strnicmp(a, b, la) == 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -987,7 +1029,7 @@ static void record_finish(record *r)
     set_str(&it->cookie_file, r->cookies);
     it->mode = clampi(r->mode, MODE_AUTO, MODE_YTDLP);
     it->conns = clampi(r->conns > 0 ? r->conns : g_set.conns, 1, UL_MAX_CONN);
-    it->quality = r->quality > 0 ? r->quality : 0;
+    it->quality = r->quality > 0 || r->quality == UL_AUDIO_ONLY ? r->quality : 0;
     if (r->added > 0) it->added = r->added;
     it->state = r->state;
     ul_task *t = it->t;
@@ -1157,6 +1199,9 @@ static ul_config *build_cfg(const item *it)
 {
     ul_config *c = default_cfg();
     if (is_abs_path(it->dir)) set_str(&c->out_dir, it->dir);
+    /* categories sort what goes to the default folder; a folder picked by
+       hand for this download is used as it is (#1) */
+    c->by_category = g_set.cats && same_dir(c->out_dir, g_set.dir);
     if (it->out_name) c->out_name = xstrdup(it->out_name);
     if (it->referer) c->referer = xstrdup(it->referer);
     if (it->ua) c->user_agent = xstrdup(it->ua);
@@ -1167,7 +1212,7 @@ static ul_config *build_cfg(const item *it)
     c->force_direct = it->mode == MODE_DIRECT;
     c->force_ytdlp = it->mode == MODE_YTDLP;
     c->connections = clampi(it->conns > 0 ? it->conns : g_set.conns, 1, UL_MAX_CONN);
-    c->max_height = it->quality > 0 ? it->quality : 0;
+    c->max_height = it->quality > 0 || it->quality == UL_AUDIO_ONLY ? it->quality : 0;
     return c;
 }
 
@@ -1587,7 +1632,8 @@ static void hide_to_tray(void)
     if (!g_set.tray_hint) {
         g_set.tray_hint = 1;
         tray_balloon(L"U-loader is still running",
-                     "Downloads continue in the background. Click the icon to open the window.", NIIF_INFO);
+                     "Downloads continue in the background. Click this icon to open the window, "
+                     "or right-click it and choose Exit to quit.", NIIF_INFO);
         settings_save();
     }
 }
@@ -1908,6 +1954,8 @@ static const struct {
     { IDM_OPEN,       0xE8E5, L"Open",        L"Open the downloaded file (Enter)",      RGB(0x00, 0x67, 0xC0) },
     { IDM_OPENFOLDER, 0xE838, L"Open folder", L"Show the file in its folder",           RGB(0xB0, 0x80, 0x00) },
     { 0, 0, NULL, NULL, 0 },
+    { IDM_LIMITER,    0xE916, L"Speed limiter", L"Limit the total speed of all downloads (the value is in Settings)",
+                                                                                         RGB(0x6B, 0x3F, 0xA0) },
     { IDM_SETTINGS,   0xE713, L"Settings",    L"Settings, browser integration and yt-dlp", RGB(0x55, 0x55, 0x55) },
 };
 #define NTOOLS ((int)(sizeof TOOLS / sizeof *TOOLS))
@@ -1966,6 +2014,10 @@ static void create_toolbar(void)
         bt[i].idCommand = TOOLS[i].cmd;
         bt[i].fsState = TBSTATE_ENABLED;
         bt[i].fsStyle = BTNS_BUTTON | BTNS_AUTOSIZE | BTNS_SHOWTEXT;
+        if (TOOLS[i].cmd == IDM_LIMITER) {               /* stays pressed while the limiter is on */
+            bt[i].fsStyle |= BTNS_CHECK;
+            if (g_set.limit_on) bt[i].fsState |= TBSTATE_CHECKED;
+        }
         bt[i].iString = (INT_PTR)TOOLS[i].text;
     }
     SendMessageW(g_tb, TB_ADDBUTTONSW, NTOOLS, (LPARAM)bt);
@@ -2006,6 +2058,7 @@ static void update_toolbar(void)
     set_tool(IDM_DELETE, n > 0);
     set_tool(IDM_OPEN, can_open);
     set_tool(IDM_OPENFOLDER, n > 0);
+    if (g_tb) SendMessageW(g_tb, TB_CHECKBUTTON, IDM_LIMITER, MAKELPARAM(g_set.limit_on ? TRUE : FALSE, 0));
 }
 
 /* ------------------------------------------------------------------ */
@@ -2837,9 +2890,11 @@ static void update_status(void)
     char a[200], b[200], s[32];
     snprintf(a, sizeof a, "%d download%s   \xC2\xB7   %d active   \xC2\xB7   %d queued   \xC2\xB7   %d complete",
              g_n, g_n == 1 ? "" : "s", active, queued, done);
-    if (g_set.limit_kb > 0)
-        snprintf(b, sizeof b, "\xE2\x86\x93 %s/s   (limit %d KB/s each)", fmt_size(speed, s, sizeof s), g_set.limit_kb);
-    else
+    if (g_set.limit_on && g_set.limit_kb > 0) {
+        char l[32];
+        snprintf(b, sizeof b, "\xE2\x86\x93 %s/s   \xC2\xB7   speed limiter: %s/s", fmt_size(speed, s, sizeof s),
+                 fmt_size((int64_t)g_set.limit_kb * 1024, l, sizeof l));
+    } else
         snprintf(b, sizeof b, "\xE2\x86\x93 %s/s", fmt_size(speed, s, sizeof s));
     wchar_t wa[200], wb[200];
     u8w(a, wa, 200);
@@ -3274,13 +3329,14 @@ static int settings_apply(HWND d)
     UINT conns = GetDlgItemInt(d, IDC_S_CONNS, &ok1, FALSE);
     UINT maxa = GetDlgItemInt(d, IDC_S_MAXACT, &ok2, FALSE);
     UINT lim = GetDlgItemInt(d, IDC_S_LIMIT, &ok3, FALSE);
-    if (GetWindowTextLengthW(GetDlgItem(d, IDC_S_LIMIT)) == 0) { ok3 = TRUE; lim = 0; }
+    int lim_on = IsDlgButtonChecked(d, IDC_S_LIMITON) == BST_CHECKED;
+    if (!lim_on && (!ok3 || lim == 0)) { ok3 = TRUE; lim = (UINT)g_set.limit_kb; }   /* off: keep the old value */
     const wchar_t *err = NULL;
     int focus = 0;
     if (!is_abs_path(dt)) { err = L"Choose a default folder (a full path such as C:\\Downloads)."; focus = IDC_S_DIR; }
     else if (!ok1 || conns < 1 || conns > UL_MAX_CONN) { err = L"Connections must be a number from 1 to 32."; focus = IDC_S_CONNS; }
     else if (!ok2 || maxa < 1 || maxa > 20) { err = L"Simultaneous downloads must be a number from 1 to 20."; focus = IDC_S_MAXACT; }
-    else if (!ok3 || lim > 10000000) { err = L"The speed limit must be a number of KB/s (0 = unlimited)."; focus = IDC_S_LIMIT; }
+    else if (!ok3 || lim < 1 || lim > 10000000) { err = L"The speed limit must be a number of KB/s (1 or more)."; focus = IDC_S_LIMIT; }
     if (err) {
         free(dir);
         MessageBoxW(d, err, L"Settings", MB_OK | MB_ICONINFORMATION);
@@ -3292,10 +3348,14 @@ static int settings_apply(HWND d)
     g_set.conns = (int)conns;
     g_set.max_active = (int)maxa;
     g_set.limit_kb = (int)lim;
+    g_set.limit_on = lim_on;
+    g_set.cats = IsDlgButtonChecked(d, IDC_S_CATS) == BST_CHECKED;
     g_set.clip = IsDlgButtonChecked(d, IDC_S_CLIP) == BST_CHECKED;
     g_set.tray = IsDlgButtonChecked(d, IDC_S_TRAY) == BST_CHECKED;
     clip_listen(g_set.clip);
+    apply_limiter();                 /* running downloads follow at once */
     settings_save();
+    update_toolbar();
     update_status();
     schedule();
     return 1;
@@ -3315,6 +3375,8 @@ static INT_PTR CALLBACK settings_proc(HWND d, UINT m, WPARAM w, LPARAM l)
         SendDlgItemMessageW(d, IDC_S_MAXACT_SPIN, UDM_SETRANGE32, 1, 20);
         SendDlgItemMessageW(d, IDC_S_MAXACT_SPIN, UDM_SETPOS32, 0, g_set.max_active);
         SetDlgItemInt(d, IDC_S_LIMIT, (UINT)g_set.limit_kb, FALSE);
+        CheckDlgButton(d, IDC_S_LIMITON, g_set.limit_on ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(d, IDC_S_CATS, g_set.cats ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(d, IDC_S_CLIP, g_set.clip ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(d, IDC_S_TRAY, g_set.tray ? BST_CHECKED : BST_UNCHECKED);
         char *ed = exe_dir();
@@ -3424,7 +3486,7 @@ static int accept_job(const char *path)
     set_str(&it->cookie_file, cfg->cookie_file);
     it->mode = cfg->force_ytdlp ? MODE_YTDLP : cfg->force_direct ? MODE_DIRECT : MODE_AUTO;
     it->conns = clampi(cfg->connections, 1, UL_MAX_CONN);
-    it->quality = cfg->max_height > 0 ? cfg->max_height : 0;
+    it->quality = cfg->max_height > 0 || cfg->max_height == UL_AUDIO_ONLY ? cfg->max_height : 0;
     link_seen(url, 1);
     snap_update(it);
     add_items(&it, 1, 1);
@@ -3678,6 +3740,11 @@ static void tray_menu(int x, int y)
     AppendMenuW(m, MF_STRING, IDM_SHOW, L"&Show U-loader");
     AppendMenuW(m, MF_STRING | (g_modal ? MF_GRAYED : 0), IDM_ADD, L"&Add link...");
     AppendMenuW(m, MF_STRING | (any ? 0 : MF_GRAYED), IDM_PAUSEALL, L"&Pause all");
+    wchar_t lim[80];
+    char ls[32];
+    fmt_size((int64_t)g_set.limit_kb * 1024, ls, sizeof ls);
+    swprintf(lim, 80, L"Speed &limiter (%hs/s)", ls);
+    AppendMenuW(m, MF_STRING | (g_set.limit_on ? MF_CHECKED : 0), IDM_LIMITER, lim);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"E&xit");
     SetMenuDefaultItem(m, IDM_SHOW, FALSE);
@@ -3775,6 +3842,13 @@ static void on_command(int id, int code)
         break;
     case IDM_SETTINGS:
         open_settings();
+        break;
+    case IDM_LIMITER:                       /* toolbar button / tray menu: on <-> off (#2) */
+        g_set.limit_on = !g_set.limit_on;
+        apply_limiter();
+        settings_save();
+        update_toolbar();
+        update_status();
         break;
     case IDM_COPYLINK:
         copy_links();
@@ -4003,10 +4077,10 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         on_create(hwnd);
         return 0;
     case WM_SIZE:
-        if (wp == SIZE_MINIMIZED) {
-            if (g_set.tray && !g_exiting) hide_to_tray();
-            return 0;
-        }
+        /* Minimize is a normal minimize: the window stays on the taskbar
+           (people look for it there). Only closing it keeps U-loader
+           running in the notification area - see WM_CLOSE. */
+        if (wp == SIZE_MINIMIZED) return 0;
         layout();
         return 0;
     case WM_GETMINMAXINFO: {
@@ -4359,6 +4433,7 @@ int WINAPI wWinMain(HINSTANCE hinst, HINSTANCE prev, PWSTR cmdline, int show)
                 ICC_WIN95_CLASSES;
     InitCommonControlsEx(&icc);
     settings_load();
+    apply_limiter();
 
     WNDCLASSEXW wc;
     memset(&wc, 0, sizeof wc);
