@@ -3,7 +3,7 @@
  *
  * The file is split into segments, one per connection. Whenever a
  * connection finishes its segment it takes over the second half of the
- * largest remaining segment ("dynamic segmentation", the trick IDM uses),
+ * largest remaining segment ("dynamic segmentation"),
  * so every connection stays busy until the very last byte.
  *
  * Progress is checkpointed to "<file>.ulstate" so an interrupted download

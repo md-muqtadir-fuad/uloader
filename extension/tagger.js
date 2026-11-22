@@ -1,5 +1,5 @@
-// U-loader video tagger: a small "U-loader" button that pops up on videos
-// (like IDM's download panel). Runs in every page and frame.
+// U-loader video tagger: a small "U-loader" button that pops up on videos.
+// Runs in every page and frame.
 //
 // Security: the button lives in a CLOSED shadow root, so page scripts can't
 // reach or click it, and every action requires a trusted (real user /

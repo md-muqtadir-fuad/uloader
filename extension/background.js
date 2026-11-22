@@ -1,7 +1,7 @@
 // U-loader browser extension - background service worker.
 //
 // * Right-click menus: send a link / media / page to U-loader.
-// * Captures browser downloads of chosen file types (like IDM). The browser
+// * Captures browser downloads of chosen file types. The browser
 //   copy is only paused while U-loader checks it can get the file; if it
 //   can't (login walls, 403s, U-loader not installed) the browser resumes
 //   its own download, so nothing is ever lost.

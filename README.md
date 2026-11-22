@@ -70,7 +70,7 @@ Then:
   the download.
 - Right-click a link, video or page → **Download with U-loader**.
 
-If IDM is installed, turn off its browser integration, or it takes the downloads first.
+If another download manager is installed, turn off its browser integration, or it takes the downloads first.
 
 ### Command line
 
@@ -107,7 +107,7 @@ uloader -i links.txt --categories
 |---|---|
 | Video sites fail or show low qualities | yt-dlp updates itself daily; to force it: **Settings → Install / update yt-dlp**. Install Deno (`winget install DenoLand.Deno`) |
 | Video and audio saved separately | Install FFmpeg (`winget install Gyan.FFmpeg`) |
-| Browser downloads are not caught | The popup must say *connected* (run `uloader --install`); check the file type list; turn off IDM's integration |
+| Browser downloads are not caught | The popup must say *connected* (run `uloader --install`); check the file type list; turn off other download managers' browser integration |
 | Files go into `Video\`, `Music\`, ... | Turn off **Sort into folders by type** in Settings |
 
 Not supported: FTPS, DRM-protected video (Netflix, Spotify, ...), seeding torrents.

@@ -14,7 +14,7 @@
 // __uloader_test_*): nothing ever reaches a real U-loader window, and the
 // browser saves into <out dir>, never the user's Downloads folder.
 // The ping needs `uloader --install`. Node 22+ (global WebSocket).
-import { spawn, execSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, existsSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -141,13 +141,14 @@ try {
   }, 15000);
   ok("video on a page is detected", media, media ? `${media.kind}, ${media.size} bytes` : "");
 
-  // download capture. If another download manager (e.g. IDM) is hooked into
-  // the browser it grabs real downloads before extensions see them, so then
-  // feed the extension's capture handler a download item directly.
-  const idm = execSync('tasklist /FI "IMAGENAME eq IDMan.exe" /NH').toString().includes("IDMan.exe");
+  // download capture. If another download manager is hooked into the browser
+  // it grabs real downloads before extensions see them: set
+  // UL_E2E_DIRECT_CAPTURE=1 to feed the extension's capture handler a
+  // download item directly instead.
+  const direct = process.env.UL_E2E_DIRECT_CAPTURE === "1";
   const capture = async (name) => {
     await ext.eval(`chrome.storage.session.remove("lastCapture").then(() => true)`);
-    if (idm) {
+    if (direct) {
       await ext.eval(`maybeCapture({ id: 987654321, url: ${JSON.stringify(base + "/r/" + name)},
           finalUrl: ${JSON.stringify(base + "/r/" + name)}, filename: ${JSON.stringify(name)},
           referrer: ${JSON.stringify(base + "/videopage/clip.mp4")}, incognito: false })`);
@@ -161,7 +162,7 @@ try {
     }
     return waitFor(async () => (await ext.eval(`chrome.storage.session.get("lastCapture")`))?.lastCapture, 15000);
   };
-  const note = idm ? " (IDM running: handler called directly)" : "";
+  const note = direct ? " (handler called directly)" : "";
 
   // 5. U-loader takes it: the browser's copy is cancelled and erased
   const last = await capture(captureName);
@@ -176,7 +177,7 @@ try {
   await ext.eval(`chrome.storage.local.set({ __uloader_test_reply: { ok: false, error: "refused", status: 403 } }).then(() => true)`);
   const refused = await capture("three.bin");
   ok("refused hand-over is reported" + note, refused && refused.ok === false && refused.status === 403, JSON.stringify(refused));
-  if (!idm) {
+  if (!direct) {
     const kept = await waitFor(() => existsSync(join(outDir, "three.bin")) && statSync(join(outDir, "three.bin")).size === 3000007, 20000);
     ok("the browser kept and finished its own download", kept);
   }
